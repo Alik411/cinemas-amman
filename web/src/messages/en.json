@@ -1,0 +1,92 @@
+{
+  "nav": {
+    "home": "Home",
+    "movies": "Movies",
+    "cinemas": "Cinemas",
+    "search": "Search",
+    "admin": "Admin"
+  },
+  "hero": {
+    "title": "CineAmman",
+    "subtitle": "All Amman cinema showtimes in one place",
+    "searchPlaceholder": "Search movies or cinemas..."
+  },
+  "home": {
+    "nowShowing": "Now Showing",
+    "todaysShowtimes": "Today's Showtimes",
+    "filterByCinema": "All Cinemas",
+    "filterByType": "All Types",
+    "noShowtimes": "No showtimes found for today — check back soon!",
+    "noShowtimesHint": "Our scrapers run every 6 hours. Try selecting a different date.",
+    "bookTickets": "Book Tickets",
+    "viewMore": "View All Showtimes"
+  },
+  "movie": {
+    "synopsis": "Synopsis",
+    "genre": "Genre",
+    "duration": "Duration",
+    "rating": "Rating",
+    "minutes": "min",
+    "trailer": "Watch Trailer",
+    "showtimes": "Showtimes",
+    "youMightAlsoLike": "You Might Also Like",
+    "noPoster": "No poster available",
+    "noTrailer": "No trailer available",
+    "noShowtimes": "No upcoming showtimes found"
+  },
+  "cinema": {
+    "nowShowing": "Now Showing",
+    "address": "Address",
+    "getDirections": "Get Directions",
+    "noMovies": "No movies currently showing"
+  },
+  "search": {
+    "placeholder": "Search movies and cinemas...",
+    "movies": "Movies",
+    "cinemas": "Cinemas",
+    "noResults": "No results found",
+    "noResultsHint": "Try a different search term"
+  },
+  "chatbot": {
+    "title": "CineAmman Guide",
+    "welcome": "Hi! I'm your CineAmman guide. Ask me what's showing in Amman tonight, or tell me what kind of movie you're in the mood for!",
+    "placeholder": "Ask about movies or showtimes...",
+    "send": "Send",
+    "open": "Open chat",
+    "close": "Close chat",
+    "typing": "Typing..."
+  },
+  "common": {
+    "today": "Today",
+    "tomorrow": "Tomorrow",
+    "loading": "Loading...",
+    "error": "Something went wrong",
+    "retry": "Try again",
+    "backToHome": "Back to Home",
+    "language": "العربية",
+    "2d": "2D",
+    "3d": "3D",
+    "imax": "IMAX",
+    "4dx": "4DX",
+    "english": "English",
+    "arabic": "Arabic",
+    "dubbed": "Dubbed"
+  },
+  "admin": {
+    "title": "Admin Dashboard",
+    "scraperStatus": "Scraper Status",
+    "lastRun": "Last Run",
+    "runNow": "Run Scrapers Now",
+    "running": "Running...",
+    "totalMovies": "Total Movies",
+    "totalShowtimes": "Total Showtimes",
+    "recentLogs": "Recent Scraper Logs",
+    "cinema": "Cinema",
+    "status": "Status",
+    "found": "Found",
+    "duration": "Duration",
+    "success": "Success",
+    "failed": "Failed",
+    "partial": "Partial"
+  }
+}

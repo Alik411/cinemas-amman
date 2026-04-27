@@ -21,12 +21,34 @@ export async function POST(req: NextRequest) {
       .lte('show_date', tomorrow)
       .limit(200)
 
-    const showtimesJson = JSON.stringify(showtimes ?? [])
+    // Format compactly: group by movie+date so all movies fit in context
+    type ShowtimeRow = {
+      show_date: string
+      show_time: string
+      screen_type: string
+      language: string
+      booking_url: string | null
+      movies: { title_en: string; title_ar: string | null; genre_tags: string[]; duration_mins: number | null } | null
+      cinemas: { name_en: string; name_ar: string | null } | null
+    }
+    const rows: ShowtimeRow[] = (showtimes as ShowtimeRow[]) ?? []
+    const grouped: Record<string, string[]> = {}
+    for (const s of rows) {
+      const movieTitle = s.movies?.title_en ?? 'Unknown'
+      const key = `${movieTitle}|${s.show_date}`
+      const time = `${s.show_time.slice(0, 5)}@${s.cinemas?.name_en ?? '?'}${s.screen_type !== '2D' ? `(${s.screen_type})` : ''}`
+      if (!grouped[key]) grouped[key] = []
+      grouped[key].push(time)
+    }
+    const showtimesText = Object.entries(grouped).map(([key, times]) => {
+      const [title, date] = key.split('|')
+      return `${title} [${date}]: ${times.join(', ')}`
+    }).join('\n')
 
     const systemPrompt = `You are CineAmman's friendly cinema guide for Amman, Jordan. You help people find movies and showtimes. You have access to today's and tomorrow's complete showtimes for all Amman cinemas.
 
-Current showtimes data:
-${showtimesJson.slice(0, 8000)}
+Current showtimes (format: Movie [date]: time@cinema):
+${showtimesText}
 
 Rules:
 - Always be helpful and friendly

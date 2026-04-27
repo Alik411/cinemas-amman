@@ -22,21 +22,14 @@ export async function POST(req: NextRequest) {
       .limit(200)
 
     // Format compactly: group by movie+date so all movies fit in context
-    type ShowtimeRow = {
-      show_date: string
-      show_time: string
-      screen_type: string
-      language: string
-      booking_url: string | null
-      movies: { title_en: string; title_ar: string | null; genre_tags: string[]; duration_mins: number | null } | null
-      cinemas: { name_en: string; name_ar: string | null } | null
-    }
-    const rows: ShowtimeRow[] = (showtimes as ShowtimeRow[]) ?? []
+    const rows: any[] = showtimes ?? []
     const grouped: Record<string, string[]> = {}
     for (const s of rows) {
-      const movieTitle = s.movies?.title_en ?? 'Unknown'
+      const mov = Array.isArray(s.movies) ? s.movies[0] : s.movies
+      const cin = Array.isArray(s.cinemas) ? s.cinemas[0] : s.cinemas
+      const movieTitle = mov?.title_en ?? 'Unknown'
       const key = `${movieTitle}|${s.show_date}`
-      const time = `${s.show_time.slice(0, 5)}@${s.cinemas?.name_en ?? '?'}${s.screen_type !== '2D' ? `(${s.screen_type})` : ''}`
+      const time = `${s.show_time.slice(0, 5)}@${cin?.name_en ?? '?'}${s.screen_type !== '2D' ? `(${s.screen_type})` : ''}`
       if (!grouped[key]) grouped[key] = []
       grouped[key].push(time)
     }

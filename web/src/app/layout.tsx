@@ -9,6 +9,9 @@ const inter = Inter({ subsets: ['latin'] })
 export const metadata: Metadata = {
   title: 'CineAmman | سينما عمّان',
   description: 'All Amman cinema showtimes in one place — جميع عروض سينمات عمّان في مكان واحد',
+  verification: {
+    google: '85qoVplLBCw-OHBeObgGXnRdF63AuoCd3W9yineRmzg',
+  },
 }
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {

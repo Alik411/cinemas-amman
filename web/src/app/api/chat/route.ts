@@ -19,7 +19,7 @@ export async function POST(req: NextRequest) {
       .select('show_date, show_time, screen_type, language, booking_url, movies(title_en, title_ar, genre_tags, duration_mins), cinemas(name_en, name_ar)')
       .gte('show_date', today)
       .lte('show_date', tomorrow)
-      .limit(200)
+      .limit(500)
 
     // Format compactly: group by movie+date so all movies fit in context
     const rows: any[] = showtimes ?? []

@@ -8,6 +8,18 @@ import ChatBot from '@/components/ChatBot'
 import MovieCard from '@/components/MovieCard'
 import { MapPin, ArrowLeft, ExternalLink } from 'lucide-react'
 
+export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params
+  const { createClient } = await import('@/lib/supabase/server')
+  const supabase = await createClient()
+  const { data: cinema } = await supabase.from('cinemas').select('name_en, address_en').eq('slug', slug).single()
+  if (!cinema) return {}
+  return {
+    title: `${cinema.name_en} Showtimes Today | CineAmman`,
+    description: `Today's movie showtimes at ${cinema.name_en}${cinema.address_en ? `, ${cinema.address_en}` : ''}. Book tickets online.`,
+  }
+}
+
 export default async function CinemaPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params
   const locale = await getLocale()

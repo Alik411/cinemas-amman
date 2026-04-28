@@ -11,6 +11,20 @@ import MovieCard from '@/components/MovieCard'
 import { Clock, Star, Calendar, ArrowLeft } from 'lucide-react'
 import type { ShowtimeWithRelations, Movie } from '@/types/database'
 
+export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params
+  const { createClient } = await import('@/lib/supabase/server')
+  const supabase = await createClient()
+  const { data: movie } = await supabase.from('movies').select('title_en, synopsis_en, genre_tags').eq('slug', slug).single()
+  if (!movie) return {}
+  return {
+    title: `${movie.title_en} Showtimes in Amman | CineAmman`,
+    description: movie.synopsis_en
+      ? `${movie.synopsis_en.slice(0, 150)}... Book tickets for ${movie.title_en} at Amman cinemas.`
+      : `Find showtimes and book tickets for ${movie.title_en} at cinemas in Amman, Jordan.`,
+  }
+}
+
 export default async function MoviePage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params
   const locale = await getLocale()

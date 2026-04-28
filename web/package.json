@@ -12,6 +12,7 @@
     "@anthropic-ai/sdk": "^0.91.1",
     "@supabase/ssr": "^0.10.2",
     "@supabase/supabase-js": "^2.104.1",
+    "@vercel/analytics": "^2.0.1",
     "date-fns": "^4.1.0",
     "lucide-react": "^1.11.0",
     "next": "14.2.35",

@@ -36,7 +36,9 @@ export default function MoviesSection({ moviesWithShowtimes, cinemas, locale }: 
     <>
       {/* Filters */}
       <div className="flex flex-wrap gap-3">
+        <label className="sr-only" htmlFor="cinema-filter">{t('filterByCinema')}</label>
         <select
+          id="cinema-filter"
           value={cinemaFilter}
           onChange={e => setCinemaFilter(e.target.value)}
           className="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-amber-500"
@@ -49,7 +51,9 @@ export default function MoviesSection({ moviesWithShowtimes, cinemas, locale }: 
           ))}
         </select>
 
+        <label className="sr-only" htmlFor="type-filter">{t('filterByType')}</label>
         <select
+          id="type-filter"
           value={typeFilter}
           onChange={e => setTypeFilter(e.target.value)}
           className="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-amber-500"

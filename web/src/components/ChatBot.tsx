@@ -87,7 +87,7 @@ export default function ChatBot({ locale }: ChatBotProps) {
               </div>
               <span className="font-semibold text-white text-sm">{t('title')}</span>
             </div>
-            <button onClick={() => setOpen(false)} className="text-zinc-400 hover:text-white transition-colors">
+            <button onClick={() => setOpen(false)} aria-label={t('close')} className="text-zinc-400 hover:text-white transition-colors">
               <X size={20} />
             </button>
           </div>
@@ -130,6 +130,7 @@ export default function ChatBot({ locale }: ChatBotProps) {
             <button
               onClick={sendMessage}
               disabled={!input.trim() || loading}
+              aria-label={t('send')}
               className="bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black rounded-xl px-3 transition-colors"
             >
               <Send size={16} />

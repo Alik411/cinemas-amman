@@ -35,7 +35,7 @@ export default function Header({ locale }: HeaderProps) {
         </nav>
 
         <div className="flex items-center gap-3">
-          <Link href="/search" className="text-zinc-400 hover:text-white transition-colors">
+          <Link href="/search" aria-label="Search" className="text-zinc-400 hover:text-white transition-colors">
             <Search size={18} />
           </Link>
           <button
@@ -47,6 +47,7 @@ export default function Header({ locale }: HeaderProps) {
           <button
             className="md:hidden text-zinc-400 hover:text-white"
             onClick={() => setMenuOpen(!menuOpen)}
+            aria-label={menuOpen ? 'Close menu' : 'Open menu'}
           >
             {menuOpen ? <X size={20} /> : <Menu size={20} />}
           </button>

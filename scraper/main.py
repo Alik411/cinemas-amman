@@ -132,7 +132,8 @@ async def parse_with_claude(html: str, cinema_name: str) -> list[dict]:
     # Send up to 150k chars — elcinema pages are 400-450k but showtimes are in the first portion
     html_snippet = html[:150_000]
 
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    from datetime import timedelta
+    today = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%Y-%m-%d')
     prompt = f"""Extract all movie showtimes from this cinema website HTML for {cinema_name}.
 
 This page is from elcinema.com — an Arabic cinema listings site.
@@ -429,7 +430,9 @@ async def run_scraper_for_cinema(cinema: dict) -> None:
 async def run_all_scrapers() -> None:
     print('=' * 50)
     print('CineAmman Scraper starting...')
-    print(f'Time: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}')
+    from datetime import timedelta
+    jordan_time = datetime.now(timezone.utc) + timedelta(hours=3)
+    print(f'Time: {jordan_time.strftime("%Y-%m-%d %H:%M")} Amman')
     print('=' * 50)
 
     result = supabase.table('cinemas').select('*').eq('active', True).execute()

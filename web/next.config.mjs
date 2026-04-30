@@ -9,6 +9,7 @@ const nextConfig = {
       { protocol: 'https', hostname: '**.tmdb.org' },
       { protocol: 'https', hostname: '**.supabase.co' },
       { protocol: 'https', hostname: 'image.tmdb.org' },
+      { protocol: 'https', hostname: '**.elcinema.com' },
     ],
   },
 }

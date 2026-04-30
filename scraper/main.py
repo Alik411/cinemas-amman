@@ -17,11 +17,12 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from supabase import create_client, Client
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'), encoding='utf-8-sig')
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'), encoding='utf-8-sig', override=True)
 
 ANTHROPIC_API_KEY   = os.environ['ANTHROPIC_API_KEY']
 SUPABASE_URL        = os.environ['NEXT_PUBLIC_SUPABASE_URL']
 SUPABASE_KEY        = os.environ['SUPABASE_SERVICE_ROLE_KEY']
+TMDB_API_KEY        = os.environ.get('TMDB_API_KEY', '')
 
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -37,17 +38,72 @@ FAILURE_THRESHOLD = 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Poster helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_poster_map(html: str) -> dict[str, str]:
+    """
+    Parses elcinema AJAX HTML and returns {movie_title_lower: poster_url}.
+    Keys include both English and Arabic titles (elcinema uses whichever language
+    the movie was registered in), so lookups must try both title_en and title_ar.
+    HTML entities like &#39; are unescaped before storing keys.
+    """
+    import html as html_module
+    poster_map: dict[str, str] = {}
+    blocks = re.findall(
+        r'<a href="/work/(\d+)/"><img[^>]+data-src="([^"]+)"[^>]*/></a>'
+        r'.*?<h3><a href="/work/\1/">([^<]+)</a>',
+        html,
+        re.DOTALL,
+    )
+    for _work_id, poster_url, title in blocks:
+        # Upgrade from 150x200 thumbnail to a larger size
+        poster_url = poster_url.replace('_150x200_', '_310x413_')
+        # Unescape HTML entities (e.g. &#39; → ')
+        clean_title = html_module.unescape(title.strip())
+        poster_map[clean_title.lower()] = poster_url
+    return poster_map
+
+
+async def fetch_tmdb_poster(title_en: str) -> str | None:
+    """Searches TMDB for a movie and returns its poster URL, or None."""
+    import aiohttp
+    if not TMDB_API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                'https://api.themoviedb.org/3/search/movie',
+                params={'query': title_en, 'language': 'en-US', 'page': 1},
+                headers={'Authorization': f'Bearer {TMDB_API_KEY}', 'accept': 'application/json'},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    results = data.get('results', [])
+                    if results and results[0].get('poster_path'):
+                        return f"https://image.tmdb.org/t/p/w500{results[0]['poster_path']}"
+    except Exception as e:
+        err = str(e).encode('ascii', errors='replace').decode('ascii')
+        print(f'  WARN TMDB lookup failed for "{title_en}": {err}')
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 1: Scrape HTML from cinema website
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def scrape_cinema(cinema: dict) -> str | None:
     """
-    Visits the cinema's scraper_url with Playwright (headless Chromium),
-    waits for content to load, and returns the full page HTML.
-    Returns None on failure.
+    Visits the cinema's scraper_url with Playwright to get the CSRF token,
+    then directly POSTs to elcinema's AJAX endpoint to fetch the showtimes HTML.
+    Returns the combined page HTML + showtime HTML, or None on failure.
     """
+    import aiohttp
+    from datetime import timedelta
     url = cinema['scraper_url']
     name = cinema['name_en']
+    today = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%Y-%m-%d')
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -70,70 +126,98 @@ async def scrape_cinema(cinema: dict) -> str | None:
                 'DNT': '1',
             },
         )
-        # Hide webdriver property
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         page = await context.new_page()
 
-        # Block images/fonts to speed up loading
-        await page.route('**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}',
-                         lambda route: route.abort())
+        # Block heavy third-party resources to load faster
+        async def block_route(route):
+            u = route.request.url
+            if any(x in u for x in [
+                '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg',
+                '.woff', '.woff2', '.ttf', 'doubleclick', 'googlesyndication',
+                'google-analytics', 'googletagmanager', 'inmobi', 'tashop',
+                'justwatch', 'twitter.com/widgets',
+            ]):
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route('**/*', block_route)
 
         try:
             print(f'  >> Visiting {url}')
-            await page.goto(url, timeout=60_000, wait_until='networkidle')
-
-            # Extra wait for JS-rendered content
-            await asyncio.sleep(random.uniform(2.0, 4.0))
-
-            # Scroll down to trigger lazy-loading
-            await page.evaluate('window.scrollTo(0, document.body.scrollHeight / 2)')
-            await asyncio.sleep(1.5)
-            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+            await page.goto(url, timeout=60_000, wait_until='load')
             await asyncio.sleep(1.5)
 
-            # Wait for any of these common showtime container selectors
-            selectors = [
-                '[class*="showtime"]', '[class*="movie"]', '[class*="schedule"]',
-                '[class*="film"]',     '[id*="showtime"]',  '[id*="movie"]',
-                'table',               '.listing',          '.content', 'main',
-            ]
-            for sel in selectors:
-                try:
-                    await page.wait_for_selector(sel, timeout=5_000)
-                    break
-                except PlaywrightTimeout:
-                    continue
+            # Get CSRF token and theater ID from the page
+            csrf_token = await page.locator('meta[name="csrf-token"]').get_attribute('content')
+            theater_id = await page.locator('#theater-showtimes-date-selector').get_attribute('data-id')
 
-            html = await page.content()
-            print(f'  OK Got {len(html):,} bytes from {name}')
-            return html
+            if not csrf_token or not theater_id:
+                # Fallback: return plain page HTML (non-elcinema pages)
+                html = await page.content()
+                print(f'  OK Got {len(html):,} chars from {name} (no AJAX endpoint found)')
+                return html
+
+            # Get cookies from Playwright context for the AJAX request
+            cookies = await context.cookies()
+            cookie_header = '; '.join(f'{c["name"]}={c["value"]}' for c in cookies)
+
+            print(f'  >> Calling AJAX endpoint for theater {theater_id}, date {today}')
+
+            # Make the POST request directly (much faster than waiting for Playwright to do it)
+            ajax_html = None
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    'https://elcinema.com/theater/ajax_show',
+                    data={'date': today, 'id': theater_id},
+                    headers={
+                        'X-CSRF-Token': csrf_token,
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Referer': url,
+                        'Origin': 'https://elcinema.com',
+                        'Cookie': cookie_header,
+                        'User-Agent': random.choice(USER_AGENTS),
+                        'X-Requested-With': 'XMLHttpRequest',
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        ajax_html = await resp.text()
+                        print(f'  >> AJAX returned {len(ajax_html):,} chars of showtime HTML')
+                    else:
+                        print(f'  WARN AJAX returned status {resp.status}')
+
+            await browser.close()
+
+            if ajax_html and len(ajax_html) > 200:
+                return ajax_html  # This is the pure showtime HTML — send directly to Claude
+            else:
+                print(f'  WARN AJAX returned empty/small response — no showtimes today?')
+                return None
 
         except PlaywrightTimeout:
             print(f'  ERR Timeout loading {name} ({url})')
+            await browser.close()
             return None
         except Exception as e:
-            print(f'  ERR Error loading {name}: {e}')
-            return None
-        finally:
+            err = str(e).encode('ascii', errors='replace').decode('ascii')
+            print(f'  ERR Error loading {name}: {err}')
             await browser.close()
+            return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 2: Parse HTML into structured showtimes using Claude
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def parse_with_claude(html: str, cinema_name: str) -> list[dict]:
-    """
-    Sends the raw HTML to Claude and gets back a structured JSON array
-    of showtime objects.
-    """
-    # Send up to 150k chars — elcinema pages are 400-450k but showtimes are in the first portion
-    html_snippet = html[:150_000]
+CHUNK_SIZE = 180_000  # chars per Claude call
 
-    from datetime import timedelta
-    today = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%Y-%m-%d')
+
+async def _call_claude_for_chunk(chunk: str, cinema_name: str, today: str, chunk_num: int) -> list[dict]:
+    """Calls Claude on one chunk of HTML and returns extracted showtimes."""
     prompt = f"""Extract all movie showtimes from this cinema website HTML for {cinema_name}.
 
 This page is from elcinema.com — an Arabic cinema listings site.
@@ -153,36 +237,77 @@ Return a JSON array where each object has exactly these keys:
 Rules:
 - Return ONLY the JSON array, no explanation, no markdown code fences.
 - Create one object per showtime (one movie at 3 times = 3 objects).
-- If no showtimes can be found, return [].
+- If no showtimes can be found in this chunk, return [].
 - Do not invent data.
 
-HTML:
-{html_snippet}"""
+HTML (chunk {chunk_num}):
+{chunk}"""
 
-    try:
-        response = await anthropic_client.messages.create(
-            model='claude-sonnet-4-5',
-            max_tokens=8096,
-            system='You are a data extraction assistant. Extract cinema showtime data from HTML and return ONLY valid JSON, no other text.',
-            messages=[{'role': 'user', 'content': prompt}],
-        )
+    response = await anthropic_client.messages.create(
+        model='claude-sonnet-4-5',
+        max_tokens=16000,
+        system='You are a data extraction assistant. Extract cinema showtime data from HTML and return ONLY valid JSON, no other text.',
+        messages=[{'role': 'user', 'content': prompt}],
+    )
 
-        raw = response.content[0].text.strip()
+    raw = response.content[0].text.strip()
+    raw = re.sub(r'^```(?:json)?\s*', '', raw)
+    raw = re.sub(r'\s*```$', '', raw)
 
-        # Strip markdown code fences if Claude added them despite instructions
-        raw = re.sub(r'^```(?:json)?\s*', '', raw)
-        raw = re.sub(r'\s*```$', '', raw)
+    result = json.loads(raw)
+    return result if isinstance(result, list) else []
 
-        showtimes = json.loads(raw)
-        print(f'  OK Claude extracted {len(showtimes)} showtimes')
-        return showtimes if isinstance(showtimes, list) else []
 
-    except json.JSONDecodeError as e:
-        print(f'  ERR Claude returned invalid JSON: {e}')
-        return []
-    except Exception as e:
-        print(f'  ERR Claude API error: {e}')
-        return []
+async def parse_with_claude(html: str, cinema_name: str) -> list[dict]:
+    """
+    Splits the HTML into chunks and calls Claude on each chunk to extract
+    showtimes. Merges all results, deduplicating by (title, date, time).
+    """
+    from datetime import timedelta
+    today = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%Y-%m-%d')
+
+    # Split into overlapping chunks so we don't miss data at boundaries
+    chunks = []
+    overlap = 5_000  # chars of overlap between chunks
+    start = 0
+    while start < len(html):
+        end = min(start + CHUNK_SIZE, len(html))
+        chunks.append(html[start:end])
+        if end == len(html):
+            break
+        start = end - overlap
+
+    print(f'  >> Sending {len(html):,} chars in {len(chunks)} chunk(s) to Claude')
+
+    all_showtimes: list[dict] = []
+    seen: set[tuple] = set()
+
+    for i, chunk in enumerate(chunks, 1):
+        try:
+            results = await _call_claude_for_chunk(chunk, cinema_name, today, i)
+            new_count = 0
+            for st in results:
+                key = (
+                    st.get('movie_title_en', '').lower().strip(),
+                    st.get('show_date', ''),
+                    st.get('show_time', ''),
+                    st.get('screen_type', '2D'),
+                )
+                if key[0] and key not in seen:
+                    seen.add(key)
+                    all_showtimes.append(st)
+                    new_count += 1
+            print(f'  OK Chunk {i}/{len(chunks)}: {len(results)} raw, {new_count} new unique showtimes')
+            if len(chunks) > 1:
+                await asyncio.sleep(0.5)
+        except json.JSONDecodeError as e:
+            print(f'  ERR Chunk {i} returned invalid JSON: {e}')
+        except Exception as e:
+            err = str(e).encode('ascii', errors='replace').decode('ascii')
+            print(f'  ERR Chunk {i} Claude error: {err}')
+
+    print(f'  OK Total: {len(all_showtimes)} unique showtimes extracted')
+    return all_showtimes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,6 +397,7 @@ async def save_to_supabase(
     showtimes: list[dict],
     cinema: dict,
     start_time: float,
+    poster_map: dict[str, str] | None = None,
 ) -> None:
     """
     Upserts movies, inserts showtimes, and writes a scraper_log entry.
@@ -307,13 +433,26 @@ async def save_to_supabase(
 
     # Fetch IDs for movies already in DB
     if existing_slugs:
-        res = supabase.table('movies').select('id, slug').execute()
+        res = supabase.table('movies').select('id, slug, poster_url').execute()
         for row in res.data:
             movie_slug_to_id[row['slug']] = row['id']
+
+    poster_map = poster_map or {}
 
     new_movies = 0
     for title_en, raw_st in seen_titles.items():
         slug = slugify(title_en)
+
+        # Resolve poster: try English title, then Arabic title from elcinema map, then TMDB
+        title_ar_raw = (raw_st.get('movie_title_ar') or '').strip().lower()
+        poster_url = (
+            poster_map.get(title_en.lower()) or
+            (poster_map.get(title_ar_raw) if title_ar_raw else None)
+        )
+        if not poster_url:
+            poster_url = await fetch_tmdb_poster(title_en)
+            if poster_url:
+                print(f'  >> TMDB poster found for: {title_en}')
 
         if slug not in existing_slugs:
             print(f'  >> Enriching new movie: {title_en}')
@@ -329,6 +468,7 @@ async def save_to_supabase(
                 'genre_tags':   enriched.get('genre_tags', []),
                 'age_rating':   enriched.get('age_rating'),
                 'duration_mins':enriched.get('duration_mins'),
+                'poster_url':   poster_url,
                 'enriched_at':  datetime.now(timezone.utc).isoformat(),
             }
             try:
@@ -339,9 +479,16 @@ async def save_to_supabase(
                 print(f'  ERR Failed to upsert movie "{title_en}": {e}')
         else:
             if slug not in movie_slug_to_id:
-                res = supabase.table('movies').select('id').eq('slug', slug).execute()
+                res = supabase.table('movies').select('id,poster_url').eq('slug', slug).execute()
                 if res.data:
                     movie_slug_to_id[slug] = res.data[0]['id']
+                    # Backfill poster if missing
+                    if not res.data[0].get('poster_url') and poster_url:
+                        try:
+                            supabase.table('movies').update({'poster_url': poster_url}).eq('slug', slug).execute()
+                            print(f'  >> Backfilled poster for: {title_en}')
+                        except Exception as e:
+                            print(f'  WARN Could not backfill poster for "{title_en}": {e}')
 
     # Insert showtimes (ignore duplicates via UNIQUE constraint)
     inserted = 0
@@ -408,23 +555,32 @@ def handle_scrape_failure(cinema: dict, error_message: str, start_time: float) -
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def run_scraper_for_cinema(cinema: dict) -> None:
+    import traceback
     print(f'\n{"="*50}')
     print(f'Cinema: {cinema["name_en"]}')
 
     start = time.time()
 
-    html = await scrape_cinema(cinema)
-    if not html:
-        handle_scrape_failure(cinema, 'Failed to load page (timeout or bot block)', start)
-        return
+    try:
+        html = await scrape_cinema(cinema)
+        if not html:
+            handle_scrape_failure(cinema, 'Failed to load page (timeout or bot block)', start)
+            return
 
-    # Basic bot-detection check: if the page is tiny it's probably a block page
-    if len(html) < 2_000:
-        handle_scrape_failure(cinema, f'Suspiciously small response ({len(html)} bytes) — possible bot block', start)
-        return
+        # Basic bot-detection check: if the page is tiny it's probably a block page
+        if len(html) < 2_000:
+            handle_scrape_failure(cinema, f'Suspiciously small response ({len(html)} bytes) — possible bot block', start)
+            return
 
-    showtimes = await parse_with_claude(html, cinema['name_en'])
-    await save_to_supabase(showtimes, cinema, start)
+        # Extract poster URLs from the raw HTML before sending to Claude
+        poster_map = extract_poster_map(html)
+        if poster_map:
+            print(f'  >> Found {len(poster_map)} poster(s) in HTML')
+
+        showtimes = await parse_with_claude(html, cinema['name_en'])
+        await save_to_supabase(showtimes, cinema, start, poster_map)
+    except Exception:
+        traceback.print_exc()
 
 
 async def run_all_scrapers() -> None:
@@ -432,8 +588,16 @@ async def run_all_scrapers() -> None:
     print('CineAmman Scraper starting...')
     from datetime import timedelta
     jordan_time = datetime.now(timezone.utc) + timedelta(hours=3)
+    today_jordan = jordan_time.strftime('%Y-%m-%d')
     print(f'Time: {jordan_time.strftime("%Y-%m-%d %H:%M")} Amman')
     print('=' * 50)
+
+    # Clean up showtimes older than today
+    try:
+        supabase.table('showtimes').delete().lt('show_date', today_jordan).execute()
+        print(f'Cleaned up old showtimes before {today_jordan}')
+    except Exception as e:
+        print(f'WARN Could not clean old showtimes: {e}')
 
     result = supabase.table('cinemas').select('*').eq('active', True).execute()
     cinemas = result.data
@@ -448,7 +612,8 @@ async def run_all_scrapers() -> None:
         try:
             await run_scraper_for_cinema(cinema)
         except Exception as e:
-            print(f'  ERR Unexpected error for {cinema["name_en"]}: {e}')
+            err_str = str(e).encode('ascii', errors='replace').decode('ascii')
+            print(f'  ERR Unexpected error for {cinema["name_en"]}: {err_str}')
 
     print(f'\n{"="*50}')
     print('All scrapers finished.')

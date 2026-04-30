@@ -420,34 +420,42 @@ async def save_to_supabase(
         if title and title not in seen_titles:
             seen_titles[title] = st
 
-    # Check which movies are already in the DB
-    existing_slugs: set[str] = set()
-    try:
-        res = supabase.table('movies').select('slug').execute()
-        existing_slugs = {row['slug'] for row in res.data}
-    except Exception as e:
-        print(f'  ERR Could not fetch existing movies: {e}')
-
-    # Enrich and upsert new movies
+    # Load all existing movies: slug→id, title_ar_lower→id
     movie_slug_to_id: dict[str, str] = {}
-
-    # Fetch IDs for movies already in DB
-    if existing_slugs:
-        res = supabase.table('movies').select('id, slug, poster_url').execute()
+    movie_ar_to_id:   dict[str, str] = {}
+    existing_slugs:   set[str]       = set()
+    try:
+        res = supabase.table('movies').select('id, slug, title_ar, poster_url').execute()
         for row in res.data:
             movie_slug_to_id[row['slug']] = row['id']
+            existing_slugs.add(row['slug'])
+            if row.get('title_ar'):
+                movie_ar_to_id[row['title_ar'].strip().lower()] = row['id']
+    except Exception as e:
+        print(f'  ERR Could not fetch existing movies: {e}')
 
     poster_map = poster_map or {}
 
     new_movies = 0
     for title_en, raw_st in seen_titles.items():
         slug = slugify(title_en)
+        title_ar_raw = (raw_st.get('movie_title_ar') or '').strip()
+
+        # Check if this movie already exists under a different English transliteration
+        # by matching on the Arabic title (prevents Saffah/Saffah duplicates)
+        if slug not in existing_slugs and title_ar_raw:
+            existing_id = movie_ar_to_id.get(title_ar_raw.lower())
+            if existing_id:
+                # Already exists — just reuse the existing movie ID
+                movie_slug_to_id[slug] = existing_id
+                print(f'  >> Matched "{title_en}" to existing movie via Arabic title')
+                # Don't create a new movie row — fall through to showtime insert
+                slug = next(s for s, i in movie_slug_to_id.items() if i == existing_id)
 
         # Resolve poster: try English title, then Arabic title from elcinema map, then TMDB
-        title_ar_raw = (raw_st.get('movie_title_ar') or '').strip().lower()
         poster_url = (
             poster_map.get(title_en.lower()) or
-            (poster_map.get(title_ar_raw) if title_ar_raw else None)
+            (poster_map.get(title_ar_raw.lower()) if title_ar_raw else None)
         )
         if not poster_url:
             poster_url = await fetch_tmdb_poster(title_en)
@@ -478,17 +486,15 @@ async def save_to_supabase(
             except Exception as e:
                 print(f'  ERR Failed to upsert movie "{title_en}": {e}')
         else:
-            if slug not in movie_slug_to_id:
-                res = supabase.table('movies').select('id,poster_url').eq('slug', slug).execute()
-                if res.data:
-                    movie_slug_to_id[slug] = res.data[0]['id']
-                    # Backfill poster if missing
-                    if not res.data[0].get('poster_url') and poster_url:
-                        try:
-                            supabase.table('movies').update({'poster_url': poster_url}).eq('slug', slug).execute()
-                            print(f'  >> Backfilled poster for: {title_en}')
-                        except Exception as e:
-                            print(f'  WARN Could not backfill poster for "{title_en}": {e}')
+            # Movie exists — backfill poster if it's missing
+            movie_id = movie_slug_to_id.get(slug)
+            if movie_id and poster_url:
+                try:
+                    # Only update if poster_url is currently null
+                    supabase.table('movies').update({'poster_url': poster_url})\
+                        .eq('id', movie_id).is_('poster_url', 'null').execute()
+                except Exception:
+                    pass
 
     # Insert showtimes (ignore duplicates via UNIQUE constraint)
     inserted = 0

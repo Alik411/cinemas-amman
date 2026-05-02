@@ -7,7 +7,20 @@
       "Bash(npm install *)",
       "Bash(npx tsc *)",
       "Bash(npm run *)",
-      "WebFetch(domain:elcinema.com)"
+      "WebFetch(domain:elcinema.com)",
+      "Bash(pip show *)",
+      "Bash(pip install *)",
+      "Bash(python main.py)",
+      "Bash(playwright install *)",
+      "Bash(python -m playwright install chromium)",
+      "Bash(Get-Content \"C:\\\\Users\\\\DELL\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-DELL-Desktop-Cinemas-Amman\\\\2e41fb2a-e401-47e9-9a9e-dd507c144a3e\\\\tasks\\\\b7ougxqxi.output\" -Wait -Tail 50)",
+      "Bash(Select-Object -First 80)",
+      "Read(//c/Users/DELL/AppData/Local/Temp/claude/C--Users-DELL-Desktop-Cinemas-Amman/2e41fb2a-e401-47e9-9a9e-dd507c144a3e/tasks/**)",
+      "Bash(python -c ' *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "mcp__Claude_in_Chrome__browser_batch"
     ]
   }
 }

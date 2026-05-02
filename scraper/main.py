@@ -41,52 +41,125 @@ FAILURE_THRESHOLD = 3
 # Poster helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_poster_map(html: str) -> dict[str, str]:
+def extract_elcinema_data(html: str) -> dict[int, dict]:
     """
-    Parses elcinema AJAX HTML and returns {movie_title_lower: poster_url}.
-    Keys include both English and Arabic titles (elcinema uses whichever language
-    the movie was registered in), so lookups must try both title_en and title_ar.
-    HTML entities like &#39; are unescaped before storing keys.
+    Parses elcinema AJAX HTML and returns {work_id: {title, poster_url}}.
+    The work_id is elcinema's stable numeric identifier for each movie —
+    the single most reliable deduplication key we have.
     """
     import html as html_module
-    poster_map: dict[str, str] = {}
+    result: dict[int, dict] = {}
     blocks = re.findall(
         r'<a href="/work/(\d+)/"><img[^>]+data-src="([^"]+)"[^>]*/></a>'
         r'.*?<h3><a href="/work/\1/">([^<]+)</a>',
         html,
         re.DOTALL,
     )
-    for _work_id, poster_url, title in blocks:
-        # Upgrade from 150x200 thumbnail to a larger size
-        poster_url = poster_url.replace('_150x200_', '_310x413_')
-        # Unescape HTML entities (e.g. &#39; → ')
+    for work_id_str, poster_url, title in blocks:
         clean_title = html_module.unescape(title.strip())
-        poster_map[clean_title.lower()] = poster_url
-    return poster_map
+        result[int(work_id_str)] = {
+            'title': clean_title,
+            'poster_url': poster_url,  # kept for reference but not used for display
+        }
+    return result
 
 
-async def fetch_tmdb_poster(title_en: str) -> str | None:
-    """Searches TMDB for a movie and returns its poster URL, or None."""
+def extract_poster_map(html: str) -> dict[str, str]:
+    """
+    Returns {title_lower: poster_url} for backward-compatible poster lookup.
+    """
+    data = extract_elcinema_data(html)
+    return {v['title'].lower(): v['poster_url'] for v in data.values()}
+
+
+def extract_date_mapping(html: str) -> dict[str, str]:
+    """
+    Extracts the date selector options from elcinema HTML.
+    Returns {arabic_label: 'YYYY-MM-DD'}, e.g. {'الخميس 30 ابريل': '2026-04-30'}.
+    This lets Claude correctly assign dates to showtimes based on section headers.
+    """
+    import html as html_module
+    mapping: dict[str, str] = {}
+    for date_val, label in re.findall(
+        r'<option value="(\d{4}-\d{2}-\d{2})"[^>]*>\s*([^<]+?)\s*</option>', html
+    ):
+        clean = html_module.unescape(label.strip())
+        mapping[clean] = date_val
+    return mapping
+
+
+async def fetch_tmdb_data(title_en: str) -> dict | None:
+    """
+    Searches TMDB for a movie and returns a dict with poster_url, synopsis_en,
+    genre_tags, duration_mins, and age_rating. Returns None if not found.
+    """
     import aiohttp
     if not TMDB_API_KEY:
         return None
     try:
+        headers = {'Authorization': f'Bearer {TMDB_API_KEY}', 'accept': 'application/json'}
         async with aiohttp.ClientSession() as session:
+            # Step 1: search for the movie
             async with session.get(
                 'https://api.themoviedb.org/3/search/movie',
                 params={'query': title_en, 'language': 'en-US', 'page': 1},
-                headers={'Authorization': f'Bearer {TMDB_API_KEY}', 'accept': 'application/json'},
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    results = data.get('results', [])
-                    if results and results[0].get('poster_path'):
-                        return f"https://image.tmdb.org/t/p/w500{results[0]['poster_path']}"
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                results = data.get('results', [])
+                if not results:
+                    return None
+                movie = results[0]
+
+            movie_id = movie.get('id')
+            poster_path = movie.get('poster_path')
+            overview = movie.get('overview', '')
+
+            # Step 2: fetch full details (runtime + release dates for rating)
+            runtime = None
+            age_rating = 'NR'
+            genre_names: list[str] = []
+            if movie_id:
+                async with session.get(
+                    f'https://api.themoviedb.org/3/movie/{movie_id}',
+                    params={'language': 'en-US', 'append_to_response': 'release_dates'},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as detail_resp:
+                    if detail_resp.status == 200:
+                        detail = await detail_resp.json()
+                        runtime = detail.get('runtime') or None
+                        genre_names = [g['name'] for g in detail.get('genres', [])]
+                        # Find US rating
+                        for entry in (detail.get('release_dates', {}).get('results') or []):
+                            if entry.get('iso_3166_1') == 'US':
+                                for rd in entry.get('release_dates', []):
+                                    cert = rd.get('certification', '').strip()
+                                    if cert:
+                                        age_rating = cert
+                                        break
+                                break
+
+            return {
+                'poster_url':    f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None,
+                'synopsis_en':   overview if overview else None,
+                'genre_tags':    genre_names,
+                'duration_mins': runtime,
+                'age_rating':    age_rating,
+            }
     except Exception as e:
         err = str(e).encode('ascii', errors='replace').decode('ascii')
         print(f'  WARN TMDB lookup failed for "{title_en}": {err}')
     return None
+
+
+async def fetch_tmdb_poster(title_en: str) -> str | None:
+    """Backward-compatible wrapper — returns just the poster URL."""
+    data = await fetch_tmdb_data(title_en)
+    return data['poster_url'] if data else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,8 +235,10 @@ async def scrape_cinema(cinema: dict) -> str | None:
                 return html
 
             # Get cookies from Playwright context for the AJAX request
+            # Only send elcinema.com cookies — sending all cookies causes nginx 400
             cookies = await context.cookies()
-            cookie_header = '; '.join(f'{c["name"]}={c["value"]}' for c in cookies)
+            ec_cookies = [c for c in cookies if 'elcinema' in c.get('domain', '')]
+            cookie_header = '; '.join(f'{c["name"]}={c["value"]}' for c in ec_cookies)
 
             print(f'  >> Calling AJAX endpoint for theater {theater_id}, date {today}')
 
@@ -216,19 +291,36 @@ async def scrape_cinema(cinema: dict) -> str | None:
 CHUNK_SIZE = 180_000  # chars per Claude call
 
 
-async def _call_claude_for_chunk(chunk: str, cinema_name: str, today: str, chunk_num: int) -> list[dict]:
+async def _call_claude_for_chunk(
+    chunk: str, cinema_name: str, today: str, chunk_num: int,
+    date_mapping: dict[str, str] | None = None,
+) -> list[dict]:
     """Calls Claude on one chunk of HTML and returns extracted showtimes."""
-    prompt = f"""Extract all movie showtimes from this cinema website HTML for {cinema_name}.
+
+    date_hint = ''
+    if date_mapping:
+        mapping_lines = '\n'.join(f'  "{k}" → {v}' for k, v in date_mapping.items())
+        date_hint = f"""
+The HTML contains showtimes for multiple dates. Use this exact mapping to assign show_date:
+{mapping_lines}
+Match each showtime to its nearest preceding date section header (e.g. <h4> or <h2> with the Arabic date).
+If you cannot determine the date for a showtime, use {today}.
+"""
+    else:
+        date_hint = f'\nAll showtimes in this HTML are for {today}.\n'
+
+    prompt = f"""Extract movie showtimes from this HTML snippet for {cinema_name}.
 
 This page is from elcinema.com — an Arabic cinema listings site.
 Movie titles may appear in English, Arabic, or both.
-Times may appear as "2:00 PM" or "14:00" — convert all to 24-hour HH:MM format.
-Dates may appear as day names ("Today", "Monday", "الاثنين") — today is {today}.
-
+Times appear as "9:15 مساء" (PM) or "10:00 صباحًا" (AM) — convert all to 24-hour HH:MM format.
+  - صباحًا / ص = AM
+  - مساءً / مساء / م = PM
+{date_hint}
 Return a JSON array where each object has exactly these keys:
 - movie_title_en: string (English title — if only Arabic is present, transliterate it)
 - movie_title_ar: string or null (Arabic title if present)
-- show_date: string in YYYY-MM-DD format
+- show_date: string in YYYY-MM-DD format (use the date mapping above)
 - show_time: string in HH:MM 24-hour format
 - screen_type: exactly one of "2D", "3D", "IMAX", "4DX" (default "2D" if unclear)
 - language: exactly one of "English", "Arabic", "Dubbed" (default "English"; use "Arabic" if the movie is in Arabic)
@@ -266,6 +358,11 @@ async def parse_with_claude(html: str, cinema_name: str) -> list[dict]:
     from datetime import timedelta
     today = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%Y-%m-%d')
 
+    # Extract the Arabic→YYYY-MM-DD date mapping from the date selector
+    date_mapping = extract_date_mapping(html)
+    if date_mapping:
+        print(f'  >> Found date mapping: {date_mapping}')
+
     # Split into overlapping chunks so we don't miss data at boundaries
     chunks = []
     overlap = 5_000  # chars of overlap between chunks
@@ -284,7 +381,7 @@ async def parse_with_claude(html: str, cinema_name: str) -> list[dict]:
 
     for i, chunk in enumerate(chunks, 1):
         try:
-            results = await _call_claude_for_chunk(chunk, cinema_name, today, i)
+            results = await _call_claude_for_chunk(chunk, cinema_name, today, i, date_mapping)
             new_count = 0
             for st in results:
                 key = (
@@ -314,21 +411,35 @@ async def parse_with_claude(html: str, cinema_name: str) -> list[dict]:
 # Step 3: Enrich new movies with Claude
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def enrich_movie_with_claude(title_en: str) -> dict:
+async def enrich_movie_with_claude(title_en: str, tmdb: dict | None = None) -> dict:
     """
-    For movies not yet in the database, asks Claude to fill in
-    Arabic title, synopsis, genres, rating, and duration.
+    Enriches a movie with Arabic title, synopsis, genres, rating, and duration.
+    Uses TMDB data where available; falls back to Claude for missing fields.
     """
-    prompt = f"""For the movie "{title_en}", provide the following information.
-Return ONLY a JSON object with exactly these keys, no other text:
-- title_ar: Arabic translation/transliteration of the title (string)
-- synopsis_en: an 80-word English synopsis (string)
-- synopsis_ar: an 80-word Arabic synopsis (string)
-- genre_tags: array of 2-4 genre strings, e.g. ["Action", "Adventure"]
-- age_rating: one of "G", "PG", "PG-13", "R", "NR" (string)
-- duration_mins: approximate runtime as an integer, or null if unknown
+    # Build what we already know from TMDB
+    known = {
+        'synopsis_en':   (tmdb or {}).get('synopsis_en'),
+        'genre_tags':    (tmdb or {}).get('genre_tags') or [],
+        'age_rating':    (tmdb or {}).get('age_rating') or 'NR',
+        'duration_mins': (tmdb or {}).get('duration_mins'),
+    }
 
-If the movie is not well-known, make reasonable estimates based on the title."""
+    # Always ask Claude for: Arabic title + Arabic synopsis (TMDB doesn't have these)
+    # Also fill in any fields TMDB missed
+    missing = [f for f in ['synopsis_en', 'genre_tags', 'age_rating', 'duration_mins'] if not known[f]]
+    fields_needed = ['title_ar', 'synopsis_ar'] + missing
+
+    prompt = f"""For the movie "{title_en}", provide ONLY the following fields.
+Return a JSON object with exactly these keys, no other text:
+{chr(10).join(f'- {f}' for f in fields_needed)}
+
+Field formats:
+- title_ar: Arabic translation/transliteration of the title
+- synopsis_ar: an 80-word Arabic synopsis
+- synopsis_en: an 80-word English synopsis
+- genre_tags: array of 2-4 genre strings e.g. ["Action", "Adventure"]
+- age_rating: one of "G", "PG", "PG-13", "R", "NR"
+- duration_mins: runtime as an integer, or null if unknown"""
 
     try:
         response = await anthropic_client.messages.create(
@@ -337,25 +448,23 @@ If the movie is not well-known, make reasonable estimates based on the title."""
             system='You are a movie database assistant. Return only valid JSON.',
             messages=[{'role': 'user', 'content': prompt}],
         )
-
         raw = response.content[0].text.strip()
         raw = re.sub(r'^```(?:json)?\s*', '', raw)
         raw = re.sub(r'\s*```$', '', raw)
-
-        data = json.loads(raw)
-        print(f'  OK Enriched: {title_en}')
-        return data
-
+        claude_data = json.loads(raw)
+        print(f'  OK Enriched: {title_en} (TMDB+Claude)')
     except Exception as e:
-        print(f'  ERR Failed to enrich "{title_en}": {e}')
-        return {
-            'title_ar': None,
-            'synopsis_en': None,
-            'synopsis_ar': None,
-            'genre_tags': [],
-            'age_rating': 'NR',
-            'duration_mins': None,
-        }
+        print(f'  WARN Claude enrichment failed for "{title_en}": {e}')
+        claude_data = {}
+
+    return {
+        'title_ar':      claude_data.get('title_ar'),
+        'synopsis_en':   known['synopsis_en'] or claude_data.get('synopsis_en'),
+        'synopsis_ar':   claude_data.get('synopsis_ar'),
+        'genre_tags':    known['genre_tags'] or claude_data.get('genre_tags', []),
+        'age_rating':    known['age_rating'] if known['age_rating'] != 'NR' else claude_data.get('age_rating', 'NR'),
+        'duration_mins': known['duration_mins'] or claude_data.get('duration_mins'),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,6 +507,7 @@ async def save_to_supabase(
     cinema: dict,
     start_time: float,
     poster_map: dict[str, str] | None = None,
+    elcinema_data: dict[int, dict] | None = None,
 ) -> None:
     """
     Upserts movies, inserts showtimes, and writes a scraper_log entry.
@@ -420,51 +530,85 @@ async def save_to_supabase(
         if title and title not in seen_titles:
             seen_titles[title] = st
 
-    # Load all existing movies: slug→id, title_ar_lower→id
-    movie_slug_to_id: dict[str, str] = {}
-    movie_ar_to_id:   dict[str, str] = {}
-    existing_slugs:   set[str]       = set()
+    # Load all existing movies: indexed by slug, elcinema_id, and title_ar
+    movie_slug_to_id:      dict[str, str] = {}
+    movie_ar_to_id:        dict[str, str] = {}
+    movie_elcinema_to_id:  dict[int, str] = {}
+    existing_slugs:        set[str]       = set()
+    elcinema_id_supported  = False  # becomes True once column is confirmed to exist
     try:
-        res = supabase.table('movies').select('id, slug, title_ar, poster_url').execute()
+        res = supabase.table('movies').select('id, slug, title_ar, elcinema_id, poster_url').execute()
+        elcinema_id_supported = True
         for row in res.data:
             movie_slug_to_id[row['slug']] = row['id']
             existing_slugs.add(row['slug'])
             if row.get('title_ar'):
                 movie_ar_to_id[row['title_ar'].strip().lower()] = row['id']
-    except Exception as e:
-        print(f'  ERR Could not fetch existing movies: {e}')
+            if row.get('elcinema_id'):
+                movie_elcinema_to_id[int(row['elcinema_id'])] = row['id']
+    except Exception:
+        # Column doesn't exist yet — fall back to slug + title_ar matching
+        try:
+            res = supabase.table('movies').select('id, slug, title_ar, poster_url').execute()
+            for row in res.data:
+                movie_slug_to_id[row['slug']] = row['id']
+                existing_slugs.add(row['slug'])
+                if row.get('title_ar'):
+                    movie_ar_to_id[row['title_ar'].strip().lower()] = row['id']
+        except Exception as e:
+            print(f'  ERR Could not fetch existing movies: {e}')
 
-    poster_map = poster_map or {}
+    poster_map    = poster_map    or {}
+    elcinema_data = elcinema_data or {}
+
+    # Build reverse map: elcinema title → work_id
+    elcinema_title_to_id: dict[str, int] = {
+        v['title'].lower(): k for k, v in elcinema_data.items()
+    }
 
     new_movies = 0
     for title_en, raw_st in seen_titles.items():
         slug = slugify(title_en)
         title_ar_raw = (raw_st.get('movie_title_ar') or '').strip()
 
-        # Check if this movie already exists under a different English transliteration
-        # by matching on the Arabic title (prevents Saffah/Saffah duplicates)
-        if slug not in existing_slugs and title_ar_raw:
-            existing_id = movie_ar_to_id.get(title_ar_raw.lower())
-            if existing_id:
-                # Already exists — just reuse the existing movie ID
-                movie_slug_to_id[slug] = existing_id
-                print(f'  >> Matched "{title_en}" to existing movie via Arabic title')
-                # Don't create a new movie row — fall through to showtime insert
-                slug = next(s for s, i in movie_slug_to_id.items() if i == existing_id)
-
-        # Resolve poster: try English title, then Arabic title from elcinema map, then TMDB
-        poster_url = (
-            poster_map.get(title_en.lower()) or
-            (poster_map.get(title_ar_raw.lower()) if title_ar_raw else None)
+        # --- Resolve elcinema work_id for this movie ---
+        # Try to match by English title first, then Arabic title in the elcinema data
+        work_id = (
+            elcinema_title_to_id.get(title_en.lower()) or
+            (elcinema_title_to_id.get(title_ar_raw.lower()) if title_ar_raw else None)
         )
-        if not poster_url:
-            poster_url = await fetch_tmdb_poster(title_en)
-            if poster_url:
-                print(f'  >> TMDB poster found for: {title_en}')
+
+        # --- Check if movie already exists (priority order) ---
+        # 1. By elcinema work_id (most reliable — immune to transliteration differences)
+        # 2. By Arabic title (catches same film with different English spellings)
+        # 3. By slug (English title match)
+        existing_id = None
+        existing_slug = None
+        if work_id and work_id in movie_elcinema_to_id:
+            existing_id = movie_elcinema_to_id[work_id]
+            existing_slug = next((s for s, i in movie_slug_to_id.items() if i == existing_id), None)
+            if existing_slug and existing_slug != slug:
+                print(f'  >> Matched "{title_en}" to existing movie via elcinema ID {work_id}')
+        elif slug not in existing_slugs and title_ar_raw:
+            ar_match_id = movie_ar_to_id.get(title_ar_raw.lower())
+            if ar_match_id:
+                existing_id = ar_match_id
+                existing_slug = next((s for s, i in movie_slug_to_id.items() if i == ar_match_id), None)
+                print(f'  >> Matched "{title_en}" to existing movie via Arabic title')
+
+        if existing_id and existing_slug:
+            movie_slug_to_id[slug] = existing_id
+            slug = existing_slug
+
+        # Fetch TMDB data (poster + synopsis + genres + runtime + rating)
+        tmdb_data = await fetch_tmdb_data(title_en)
+        poster_url = (tmdb_data or {}).get('poster_url')
+        if poster_url:
+            print(f'  >> TMDB data found for: {title_en}')
 
         if slug not in existing_slugs:
             print(f'  >> Enriching new movie: {title_en}')
-            enriched = await enrich_movie_with_claude(title_en)
+            enriched = await enrich_movie_with_claude(title_en, tmdb=tmdb_data)
             await asyncio.sleep(0.5)  # brief pause between Claude calls
 
             movie_row = {
@@ -490,14 +634,18 @@ async def save_to_supabase(
             movie_id = movie_slug_to_id.get(slug)
             if movie_id and poster_url:
                 try:
-                    # Only update if poster_url is currently null
                     supabase.table('movies').update({'poster_url': poster_url})\
                         .eq('id', movie_id).is_('poster_url', 'null').execute()
                 except Exception:
                     pass
 
     # Insert showtimes (ignore duplicates via UNIQUE constraint)
+    from datetime import timedelta
+    today_str   = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%Y-%m-%d')
+    max_date_str = (datetime.now(timezone.utc) + timedelta(hours=3, days=7)).strftime('%Y-%m-%d')
+
     inserted = 0
+    skipped_date = 0
     for st in showtimes:
         title = st.get('movie_title_en', '').strip()
         slug = slugify(title)
@@ -508,6 +656,11 @@ async def save_to_supabase(
         show_date = st.get('show_date')
         show_time = st.get('show_time')
         if not show_date or not show_time:
+            continue
+
+        # Reject showtimes outside the valid window (today → today+7)
+        if show_date < today_str or show_date > max_date_str:
+            skipped_date += 1
             continue
 
         try:
@@ -533,6 +686,8 @@ async def save_to_supabase(
         'duration_ms':     duration_ms,
     }).execute()
 
+    if skipped_date:
+        print(f'  WARN Skipped {skipped_date} showtimes with out-of-range dates')
     print(f'  OK Saved {inserted} showtimes, {new_movies} new movies ({duration_ms}ms)')
 
 
@@ -578,13 +733,16 @@ async def run_scraper_for_cinema(cinema: dict) -> None:
             handle_scrape_failure(cinema, f'Suspiciously small response ({len(html)} bytes) — possible bot block', start)
             return
 
-        # Extract poster URLs from the raw HTML before sending to Claude
-        poster_map = extract_poster_map(html)
-        if poster_map:
-            print(f'  >> Found {len(poster_map)} poster(s) in HTML')
+        # Extract elcinema work IDs from the raw HTML (used for deduplication only)
+        # We intentionally do NOT use elcinema poster URLs — they're low-res and unreliable.
+        # Posters come from TMDB instead (see fetch_tmdb_poster).
+        elcinema_data = extract_elcinema_data(html)
+        poster_map: dict[str, str] = {}  # empty — TMDB-only poster resolution
+        if elcinema_data:
+            print(f'  >> Found {len(elcinema_data)} elcinema work ID(s) in HTML')
 
         showtimes = await parse_with_claude(html, cinema['name_en'])
-        await save_to_supabase(showtimes, cinema, start, poster_map)
+        await save_to_supabase(showtimes, cinema, start, poster_map, elcinema_data)
     except Exception:
         traceback.print_exc()
 

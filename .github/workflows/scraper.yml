@@ -2,7 +2,7 @@ name: Run Scraper
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # every 6 hours
+    - cron: '0 8 * * *'   # every day at 8am UTC = 11am Amman time
   workflow_dispatch:          # also allows manual trigger from GitHub UI
 
 jobs:

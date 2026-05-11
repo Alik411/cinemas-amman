@@ -34,7 +34,7 @@ USER_AGENTS = [
 ]
 
 # How many consecutive failures before we mark a cinema inactive
-FAILURE_THRESHOLD = 3
+FAILURE_THRESHOLD = 7
 
 
 # ─────────────────────────────────────────────────────────────────────────────

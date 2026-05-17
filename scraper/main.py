@@ -170,13 +170,18 @@ async def scrape_taj_cinemas(cinema: dict) -> list[dict] | None:
     """
     Scrapes tajcinemas.com directly — no Claude needed, all data is server-rendered.
     Fetches the homepage for movie IDs, then each movie page for dates + showtimes.
-    Returns a list of showtime dicts ready for save_to_supabase.
+
+    Key insight: date_id is embedded in every booking URL
+    (/movies/982/book/748/46788 → date_id=748), so we never need to
+    split the page into date sections — we extract ALL booking links at once
+    and group them by date_id.
     """
     import aiohttp
     from datetime import timedelta
 
     today = datetime.now(timezone.utc) + timedelta(hours=3)
-    name = cinema['name_en']
+    today_str = today.strftime('%Y-%m-%d')
+    max_date_str = (today + timedelta(days=7)).strftime('%Y-%m-%d')
 
     headers = {
         'User-Agent': random.choice(USER_AGENTS),
@@ -186,7 +191,7 @@ async def scrape_taj_cinemas(cinema: dict) -> list[dict] | None:
 
     try:
         async with aiohttp.ClientSession() as session:
-            # Step 1: fetch homepage
+            # ── Step 1: fetch homepage ──────────────────────────────────────────
             async with session.get(
                 'https://tajcinemas.com/', headers=headers, timeout=aiohttp.ClientTimeout(total=30)
             ) as resp:
@@ -196,41 +201,45 @@ async def scrape_taj_cinemas(cinema: dict) -> list[dict] | None:
                 homepage_html = await resp.text()
 
             # Detect where the "Taj Class" section starts in the homepage
-            taj_class_pos = homepage_html.lower().find('taj class')
+            # (movies after this marker use 'Taj Class' as screen_type)
+            hplow = homepage_html.lower()
+            taj_class_pos = hplow.find('taj class')
             if taj_class_pos == -1:
                 taj_class_pos = homepage_html.find('id="hot"')
 
-            # Extract all movie IDs with their position (to detect Taj Class)
+            # Extract all movie IDs — try absolute URLs first, then relative
             movie_ids_seen: set[str] = set()
             movies_info: list[dict] = []
-            for m in re.finditer(r'tajcinemas\.com/movies/(\d+)', homepage_html):
-                mid = m.group(1)
-                if mid in movie_ids_seen:
-                    continue
-                movie_ids_seen.add(mid)
-                is_taj_class = taj_class_pos > 0 and m.start() > taj_class_pos
-                movies_info.append({'id': mid, 'is_taj_class': is_taj_class, 'title': None})
+
+            # Try both absolute (tajcinemas.com/movies/NNN) and relative (/movies/NNN)
+            for pattern in (r'tajcinemas\.com/movies/(\d+)', r'href=["\'][^"\']*?/movies/(\d+)'):
+                for m in re.finditer(pattern, homepage_html):
+                    mid = m.group(1)
+                    if mid in movie_ids_seen:
+                        continue
+                    movie_ids_seen.add(mid)
+                    # Get 200-char context around the link to check for TAJCLASS suffix
+                    ctx = homepage_html[max(0, m.start()-50): m.end()+200].lower()
+                    is_taj = (
+                        'tajclass' in ctx
+                        or (taj_class_pos > 0 and m.start() > taj_class_pos)
+                    )
+                    movies_info.append({'id': mid, 'is_taj_class': is_taj})
+                if movies_info:
+                    break  # found movies — don't try the second pattern
 
             if not movies_info:
                 print(f'  WARN No movies found on Taj Cinemas homepage')
                 return None
 
-            # Try to extract titles from homepage HTML
-            for info in movies_info:
-                mid = info['id']
-                pattern = rf'tajcinemas\.com/movies/{mid}["\'][^>]*>[\s\S]{{0,400}}?<h[1-6][^>]*>\s*([A-Z][^<]{{2,60}}?)\s*</h[1-6]>'
-                tm = re.search(pattern, homepage_html)
-                if tm:
-                    info['title'] = tm.group(1).strip()
-
             print(f'  >> Found {len(movies_info)} movie(s) on tajcinemas.com')
 
             all_showtimes: list[dict] = []
 
+            # ── Step 2: for each movie, fetch its page and extract showtimes ───
             for info in movies_info:
-                movie_id   = info['id']
-                is_taj     = info['is_taj_class']
-                screen_type = 'Taj Class' if is_taj else '2D'
+                movie_id    = info['id']
+                screen_type = 'Taj Class' if info['is_taj_class'] else '2D'
 
                 await asyncio.sleep(0.3)
 
@@ -242,61 +251,85 @@ async def scrape_taj_cinemas(cinema: dict) -> list[dict] | None:
                         continue
                     movie_html = await resp.text()
 
-                # Get title: use homepage extraction, else page <title> tag, else first non-TAJ h3
-                title_en = info.get('title')
+                # ── Extract title ───────────────────────────────────────────────
+                title_en = None
+                # Try <title> tag first (most reliable)
+                t = re.search(r'<title[^>]*>\s*([^<|–\-]+?)[\s|–\-]*(?:Taj|$)', movie_html, re.IGNORECASE)
+                if t:
+                    title_en = t.group(1).strip()
+                # Fallback: first non-trivial <h1> or <h2>
                 if not title_en:
-                    t = re.search(r'<title[^>]*>\s*([^<|–\-]+?)[\s|–\-]*Taj', movie_html, re.IGNORECASE)
-                    if t:
-                        title_en = t.group(1).strip()
-                if not title_en:
-                    for h3 in re.findall(r'<h3[^>]*>\s*([^<]+)\s*</h3>', movie_html):
-                        if h3.strip().upper() not in ('TAJ', 'TAJ CLASS', ''):
-                            title_en = h3.strip()
+                    for tag in ('h1', 'h2', 'h3'):
+                        for h in re.findall(rf'<{tag}[^>]*>\s*([^<]{{3,80}})\s*</{tag}>', movie_html, re.IGNORECASE):
+                            candidate = h.strip()
+                            if candidate.upper() not in ('TAJ', 'TAJ CLASS', 'NOW SHOWING', ''):
+                                title_en = candidate
+                                break
+                        if title_en:
                             break
                 if not title_en:
                     continue
 
-                # Convert ALL CAPS to Title Case (e.g. "AWEL LEILA" → "Awel Leila")
-                title_en = title_en.strip().title()
+                # Clean up: decode HTML entities, remove -TAJCLASS suffix, fix casing
+                import html as html_module
+                title_en = html_module.unescape(title_en)
+                title_en = re.sub(r'[-\s]*TAJCLASS\s*$', '', title_en, flags=re.IGNORECASE).strip()
+                if title_en == title_en.upper():
+                    title_en = title_en.title()
 
-                # Extract date tabs: href="#date-748" → "Sun 17"
-                date_tabs = re.findall(r'href="#date-(\d+)"[^>]*>\s*\w+\s+(\d+)\s*<', movie_html)
-
-                # Build date_id → YYYY-MM-DD (handles month rollover)
+                # ── Build date_id → YYYY-MM-DD from the tab navigation ─────────
+                # HTML: <a href="#date-748">Sun\n    17</a>
                 date_id_to_date: dict[str, str] = {}
-                for date_id, day_str in date_tabs:
-                    day = int(day_str)
+                for dm in re.finditer(r'href="#date-(\d+)"[^>]*>([\s\S]{0,120}?)</a', movie_html, re.IGNORECASE):
+                    date_id   = dm.group(1)
+                    tab_inner = dm.group(2)
+                    day_m     = re.search(r'(\d{1,2})', tab_inner)
+                    if not day_m:
+                        continue
+                    day = int(day_m.group(1))
                     try:
                         candidate = today.replace(day=day)
                         if candidate.date() < (today - timedelta(days=1)).date():
                             raise ValueError('past')
                     except ValueError:
+                        # Month rollover
                         m_ = today.month + 1 if today.month < 12 else 1
                         y_ = today.year if today.month < 12 else today.year + 1
-                        candidate = today.replace(year=y_, month=m_, day=day)
-                    date_id_to_date[date_id] = candidate.strftime('%Y-%m-%d')
+                        try:
+                            candidate = today.replace(year=y_, month=m_, day=day)
+                        except ValueError:
+                            continue
+                    date_str = candidate.strftime('%Y-%m-%d')
+                    if today_str <= date_str <= max_date_str:
+                        date_id_to_date[date_id] = date_str
 
-                # Extract showtimes per date section
-                for date_id, show_date in date_id_to_date.items():
-                    sec = re.search(
-                        rf'id="date-{date_id}"(.*?)(?=id="date-\d+"|\Z)',
-                        movie_html, re.DOTALL,
-                    )
-                    if not sec:
+                if not date_id_to_date:
+                    continue
+
+                # ── Extract ALL booking links (date_id is in the URL itself) ────
+                # href="/movies/982/book/748/46788" → date_id=748, session_id=46788
+                # href text (inner) → time like "16:00"
+                count_before = len(all_showtimes)
+                for bm in re.finditer(
+                    rf'href=["\'](?:https://tajcinemas\.com)?/movies/{movie_id}/book/(\d+)/(\d+)["\'][^>]*>\s*(\d{{2}}:\d{{2}})\s*<',
+                    movie_html,
+                ):
+                    date_id    = bm.group(1)
+                    session_id = bm.group(2)
+                    time_str   = bm.group(3)
+                    show_date  = date_id_to_date.get(date_id)
+                    if not show_date:
                         continue
-                    for session_id, time_str in re.findall(
-                        rf'/movies/{movie_id}/book/{date_id}/(\d+)["\'][^>]*>\s*(\d{{2}}:\d{{2}})\s*<',
-                        sec.group(1),
-                    ):
-                        all_showtimes.append({
-                            'movie_title_en': title_en,
-                            'movie_title_ar':  None,
-                            'show_date':       show_date,
-                            'show_time':       time_str,
-                            'screen_type':     screen_type,
-                            'language':        'English',
-                            'booking_url':     f'https://tajcinemas.com/movies/{movie_id}/book/{date_id}/{session_id}',
-                        })
+                    all_showtimes.append({
+                        'movie_title_en': title_en,
+                        'movie_title_ar':  None,
+                        'show_date':       show_date,
+                        'show_time':       time_str,
+                        'screen_type':     screen_type,
+                        'language':        'English',
+                        'booking_url':     f'https://tajcinemas.com/movies/{movie_id}/book/{date_id}/{session_id}',
+                    })
+                print(f'  >> {title_en}: {len(all_showtimes) - count_before} showtimes across {len(date_id_to_date)} date(s)')
 
             print(f'  >> Extracted {len(all_showtimes)} showtime(s) from tajcinemas.com')
             return all_showtimes if all_showtimes else None
@@ -338,6 +371,137 @@ async def scrape_prime_jo(cinema: dict) -> str | None:
         err = str(e).encode('ascii', errors='replace').decode('ascii')
         print(f'  ERR Error loading {name}: {err}')
         return None
+
+
+def parse_prime_jo_html(html: str, cinema: dict) -> list[dict]:
+    """
+    Custom regex parser for prime.jo cinema detail pages.
+    Avoids sending large HTML to Claude (which causes JSON truncation).
+
+    Page structure (linear, top-to-bottom):
+      <a href="//www.prime.jo/Browsing/Movies/Details/...">Movie Title</a>
+      ...
+      <h4>Sunday, 17 May 2026</h4>    ← or similar heading with date
+      ...
+      <a href="//www.prime.jo/Ticketing/visSelectTickets.aspx?cinemacode=X&txtSessionId=Y...">
+        <img src=".../AttributeIconGraphic/2D..." />
+        07:00 PM
+      </a>
+
+    We collect (position, type, data) events in document order, then replay
+    them to assign each showtime to its nearest preceding movie title + date.
+    """
+    import html as html_module
+    from datetime import timedelta, datetime as dt_class
+
+    today     = datetime.now(timezone.utc) + timedelta(hours=3)
+    today_str = today.strftime('%Y-%m-%d')
+    max_date  = (today + timedelta(days=7)).strftime('%Y-%m-%d')
+
+    MONTHS = {m: i+1 for i, m in enumerate([
+        'january','february','march','april','may','june',
+        'july','august','september','october','november','december',
+    ])}
+
+    events: list[tuple[int, str, object]] = []   # (pos, type, data)
+
+    # ── Movie title links ───────────────────────────────────────────────────────
+    # The anchor may contain just text, or an <img> followed by text, or vice versa.
+    # We strip inner HTML tags to get the text content.
+    seen_titles_at: set[int] = set()
+    for m in re.finditer(
+        r'href=["\'](?:https?:)?//www\.prime\.jo/Browsing/Movies/Details/[^"\']+["\'][^>]*>([\s\S]{0,400}?)</a>',
+        html, re.IGNORECASE,
+    ):
+        inner = m.group(1)
+        # Strip HTML tags → plain text
+        text = re.sub(r'<[^>]+>', ' ', inner)
+        text = html_module.unescape(text).strip()
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        if len(text) >= 2 and m.start() not in seen_titles_at:
+            seen_titles_at.add(m.start())
+            events.append((m.start(), 'movie', text))
+
+    # ── Date headings: "Sunday, 17 May 2026" ───────────────────────────────────
+    for m in re.finditer(
+        r'(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)'
+        r',\s+(\d{1,2})\s+(January|February|March|April|May|June|July|August'
+        r'|September|October|November|December)\s+(\d{4})',
+        html, re.IGNORECASE,
+    ):
+        day   = int(m.group(1))
+        month = MONTHS.get(m.group(2).lower(), 0)
+        year  = int(m.group(3))
+        if month:
+            date_str = f'{year}-{month:02d}-{day:02d}'
+            if today_str <= date_str <= max_date:
+                events.append((m.start(), 'date', date_str))
+
+    # ── Booking links (time + screen type embedded) ────────────────────────────
+    cinema_code = (cinema.get('scraper_url') or '').rstrip('/').split('/')[-1]
+    for m in re.finditer(
+        r'href=["\'](?:https?:)?//www\.prime\.jo/Ticketing/visSelectTickets\.aspx\?'
+        r'[^"\']*txtSessionId=(\d+)[^"\']*showtimeId=([^&"\']+)[^"\']*["\'][^>]*>'
+        r'([\s\S]{0,400}?)</a>',
+        html, re.IGNORECASE,
+    ):
+        session_id   = m.group(1)
+        showtime_id  = m.group(2)
+        inner        = m.group(3)
+
+        # Time: "07:00 PM" or "11:00 AM"
+        time_m = re.search(r'(\d{1,2}:\d{2})\s*(AM|PM)', inner, re.IGNORECASE)
+        if not time_m:
+            continue
+        try:
+            t = dt_class.strptime(f'{time_m.group(1)} {time_m.group(2).upper()}', '%I:%M %p')
+            show_time = t.strftime('%H:%M')
+        except ValueError:
+            continue
+
+        # Screen type from image src (e.g. "AttributeIconGraphic/2D")
+        st_m = re.search(r'AttributeIconGraphic[/\\](\w[\w+]*)', inner, re.IGNORECASE)
+        screen_type = (st_m.group(1) if st_m else '2D').upper().replace('+', 'X')
+        if screen_type not in ('2D', '3D', 'IMAX', '4DX'):
+            screen_type = '2D'
+
+        booking_url = (
+            f'https://www.prime.jo/Ticketing/visSelectTickets.aspx'
+            f'?cinemacode={cinema_code}&txtSessionId={session_id}'
+            f'&showtimeId={showtime_id}&visLang=1'
+        )
+        events.append((m.start(), 'showtime', {
+            'show_time':    show_time,
+            'screen_type':  screen_type,
+            'booking_url':  booking_url,
+        }))
+
+    # ── Replay events in document order ───────────────────────────────────────
+    events.sort(key=lambda x: x[0])
+    showtimes: list[dict] = []
+    current_movie: str | None = None
+    current_date:  str | None = None
+
+    for _pos, etype, data in events:
+        if etype == 'movie':
+            current_movie = data   # type: ignore[assignment]
+            current_date  = None   # reset date context when movie changes
+        elif etype == 'date':
+            current_date = data    # type: ignore[assignment]
+        elif etype == 'showtime' and current_movie and current_date:
+            d = data               # type: ignore[assignment]
+            showtimes.append({
+                'movie_title_en': current_movie,
+                'movie_title_ar': None,
+                'show_date':      current_date,
+                'show_time':      d['show_time'],
+                'screen_type':    d['screen_type'],
+                'language':       'English',
+                'booking_url':    d['booking_url'],
+            })
+
+    return showtimes
 
 
 async def scrape_cinema(cinema: dict) -> str | None:
@@ -915,7 +1079,24 @@ async def run_scraper_for_cinema(cinema: dict) -> None:
             await save_to_supabase(showtimes, cinema, start)
             return
 
-        # ── All other sources: scrape HTML → Claude → save ────────────────────
+        # ── Prime Cinemas: custom parser (HTML too large for Claude) ─────────
+        if 'prime.jo' in url:
+            html = await scrape_prime_jo(cinema)
+            if not html:
+                handle_scrape_failure(cinema, 'Failed to load prime.jo page', start)
+                return
+            if len(html) < 5_000:
+                preview = html[:400].encode('ascii', errors='replace').decode('ascii')
+                print(f'  WARN Small response from prime.jo ({len(html)} chars):')
+                print(f'  {preview}')
+                handle_scrape_failure(cinema, f'Small response from prime.jo ({len(html)} chars)', start)
+                return
+            showtimes = parse_prime_jo_html(html, cinema)
+            print(f'  OK Parsed {len(showtimes)} showtimes from prime.jo (no Claude needed)')
+            await save_to_supabase(showtimes, cinema, start)
+            return
+
+        # ── All other sources (elcinema): scrape HTML → Claude → save ────────
         html = await scrape_cinema(cinema)
         if not html:
             handle_scrape_failure(cinema, 'Failed to load page (timeout or bot block)', start)

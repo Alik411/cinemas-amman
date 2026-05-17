@@ -822,8 +822,41 @@ Field formats:
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def normalize_title(title: str) -> str:
+    """
+    Normalises a movie title so that minor source differences don't create
+    duplicate records.  Applied before slugifying AND before TMDB lookup.
+
+    Examples:
+      "Billie Eilish: Hit Me Hard and Soft 3D"           → "Billie Eilish: Hit Me Hard and Soft"
+      "Billie Eilish: Hit Me Hard and Soft - The Tour (Live in 3D)" → "Billie Eilish: Hit Me Hard and Soft"
+      "El Kalam Ala Eh (Awel Leila)"                     → "Awel Leila"
+      "El Kalam Ala Eih?!: Awal Leila"                   → "El Kalam Ala Eih?!: Awal Leila"  (unchanged)
+      "Mortal Kombat 2"                                   → "Mortal Kombat 2"  (unchanged)
+    """
+    # Strip trailing screen-format suffixes: " 3D", " IMAX", " 4DX", " Taj Class"
+    title = re.sub(r'\s+(?:3D|IMAX|4DX|Taj\s+Class)\s*$', '', title, flags=re.IGNORECASE).strip()
+
+    # Strip " - The Tour (…)" or " - Live (…)" concert-film descriptors
+    title = re.sub(r'\s+-\s+(?:The\s+)?(?:Tour|Live)[^)]*\(.*?\)\s*$', '', title, flags=re.IGNORECASE).strip()
+
+    # If the title is "Long Arabic Phrase (Shorter English Title)", prefer the
+    # shorter parenthetical — it's usually the widely-known international title.
+    # Only apply when: the part before "(" is clearly longer than the part inside.
+    paren = re.match(r'^(.+?)\s*\(([^)]{3,})\)\s*$', title)
+    if paren:
+        before, inside = paren.group(1).strip(), paren.group(2).strip()
+        # Use the parenthetical only when it is shorter (avoids swapping on e.g.
+        # "Mission Impossible (Top Secret Stuff)" where both parts are long)
+        if len(inside) < len(before) * 0.8:
+            title = inside
+
+    return title.strip()
+
+
 def slugify(text: str) -> str:
     """Converts a movie title to a URL-safe slug."""
+    text = normalize_title(text)
     text = text.lower().strip()
     text = re.sub(r'[^\w\s-]', '', text)
     text = re.sub(r'[\s_-]+', '-', text)
@@ -932,7 +965,7 @@ async def save_to_supabase(
         )
 
         # ── Fetch TMDB data early — needed for TMDB-ID dedup ─────────────────
-        tmdb_data = await fetch_tmdb_data(title_en)
+        tmdb_data = await fetch_tmdb_data(normalize_title(title_en))
         tmdb_id   = (tmdb_data or {}).get('tmdb_id')
         poster_url = (tmdb_data or {}).get('poster_url')
         if poster_url:
@@ -972,7 +1005,7 @@ async def save_to_supabase(
         if slug not in existing_slugs:
             # ── New movie: enrich and insert ─────────────────────────────────
             print(f'  >> Enriching new movie: {title_en}')
-            enriched = await enrich_movie_with_claude(title_en, tmdb=tmdb_data)
+            enriched = await enrich_movie_with_claude(normalize_title(title_en), tmdb=tmdb_data)
             await asyncio.sleep(0.5)
 
             # ── Post-enrichment dedup: Arabic title re-check ─────────────────

@@ -144,6 +144,7 @@ async def fetch_tmdb_data(title_en: str) -> dict | None:
                                 break
 
             return {
+                'tmdb_id':       movie_id,
                 'poster_url':    f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None,
                 'synopsis_en':   overview if overview else None,
                 'genre_tags':    genre_names,
@@ -880,14 +881,15 @@ async def save_to_supabase(
         if title and title not in seen_titles:
             seen_titles[title] = st
 
-    # Load all existing movies: indexed by slug, elcinema_id, and title_ar
+    # Load all existing movies: indexed by slug, elcinema_id, title_ar, and tmdb_id
     movie_slug_to_id:      dict[str, str] = {}
     movie_ar_to_id:        dict[str, str] = {}
     movie_elcinema_to_id:  dict[int, str] = {}
+    movie_tmdb_to_id:      dict[int, str] = {}
     existing_slugs:        set[str]       = set()
-    elcinema_id_supported  = False  # becomes True once column is confirmed to exist
+    elcinema_id_supported  = False
     try:
-        res = supabase.table('movies').select('id, slug, title_ar, elcinema_id, poster_url').execute()
+        res = supabase.table('movies').select('id, slug, title_ar, elcinema_id, tmdb_id, poster_url').execute()
         elcinema_id_supported = True
         for row in res.data:
             movie_slug_to_id[row['slug']] = row['id']
@@ -896,8 +898,10 @@ async def save_to_supabase(
                 movie_ar_to_id[row['title_ar'].strip().lower()] = row['id']
             if row.get('elcinema_id'):
                 movie_elcinema_to_id[int(row['elcinema_id'])] = row['id']
+            if row.get('tmdb_id'):
+                movie_tmdb_to_id[int(row['tmdb_id'])] = row['id']
     except Exception:
-        # Column doesn't exist yet — fall back to slug + title_ar matching
+        # Columns don't exist yet — fall back to slug + title_ar matching
         try:
             res = supabase.table('movies').select('id, slug, title_ar, poster_url').execute()
             for row in res.data:
@@ -921,47 +925,83 @@ async def save_to_supabase(
         slug = slugify(title_en)
         title_ar_raw = (raw_st.get('movie_title_ar') or '').strip()
 
-        # --- Resolve elcinema work_id for this movie ---
-        # Try to match by English title first, then Arabic title in the elcinema data
+        # Resolve elcinema work_id for this movie
         work_id = (
             elcinema_title_to_id.get(title_en.lower()) or
             (elcinema_title_to_id.get(title_ar_raw.lower()) if title_ar_raw else None)
         )
 
-        # --- Check if movie already exists (priority order) ---
-        # 1. By elcinema work_id (most reliable — immune to transliteration differences)
-        # 2. By Arabic title (catches same film with different English spellings)
-        # 3. By slug (English title match)
-        existing_id = None
+        # ── Fetch TMDB data early — needed for TMDB-ID dedup ─────────────────
+        tmdb_data = await fetch_tmdb_data(title_en)
+        tmdb_id   = (tmdb_data or {}).get('tmdb_id')
+        poster_url = (tmdb_data or {}).get('poster_url')
+        if poster_url:
+            print(f'  >> TMDB data found for: {title_en}')
+
+        # ── Check if movie already exists (priority order) ───────────────────
+        # 1. elcinema work_id  — immune to all transliteration differences
+        # 2. TMDB ID           — catches same film with different English titles
+        # 3. Arabic title      — catches same film if elcinema/TMDB data present
+        # 4. slug              — exact English title match
+        existing_id   = None
         existing_slug = None
+
         if work_id and work_id in movie_elcinema_to_id:
             existing_id = movie_elcinema_to_id[work_id]
             existing_slug = next((s for s, i in movie_slug_to_id.items() if i == existing_id), None)
             if existing_slug and existing_slug != slug:
-                print(f'  >> Matched "{title_en}" to existing movie via elcinema ID {work_id}')
+                print(f'  >> Matched "{title_en}" → existing movie via elcinema ID {work_id}')
+
+        elif tmdb_id and tmdb_id in movie_tmdb_to_id and slug not in existing_slugs:
+            existing_id = movie_tmdb_to_id[tmdb_id]
+            existing_slug = next((s for s, i in movie_slug_to_id.items() if i == existing_id), None)
+            if existing_slug:
+                print(f'  >> Matched "{title_en}" → existing movie via TMDB ID {tmdb_id}')
+
         elif slug not in existing_slugs and title_ar_raw:
             ar_match_id = movie_ar_to_id.get(title_ar_raw.lower())
             if ar_match_id:
                 existing_id = ar_match_id
                 existing_slug = next((s for s, i in movie_slug_to_id.items() if i == ar_match_id), None)
-                print(f'  >> Matched "{title_en}" to existing movie via Arabic title')
+                print(f'  >> Matched "{title_en}" → existing movie via Arabic title')
 
         if existing_id and existing_slug:
             movie_slug_to_id[slug] = existing_id
             slug = existing_slug
 
-        # Fetch TMDB data (poster + synopsis + genres + runtime + rating)
-        tmdb_data = await fetch_tmdb_data(title_en)
-        poster_url = (tmdb_data or {}).get('poster_url')
-        if poster_url:
-            print(f'  >> TMDB data found for: {title_en}')
-
         if slug not in existing_slugs:
+            # ── New movie: enrich and insert ─────────────────────────────────
             print(f'  >> Enriching new movie: {title_en}')
             enriched = await enrich_movie_with_claude(title_en, tmdb=tmdb_data)
-            await asyncio.sleep(0.5)  # brief pause between Claude calls
+            await asyncio.sleep(0.5)
 
-            movie_row = {
+            # ── Post-enrichment dedup: Arabic title re-check ─────────────────
+            # Handles cases like "Bershamah" vs "BERSHAMA" — same Arabic title
+            # after Claude enrichment even if English spellings differ.
+            ar_enriched = (enriched.get('title_ar') or '').strip().lower()
+            if ar_enriched and ar_enriched in movie_ar_to_id:
+                dup_id   = movie_ar_to_id[ar_enriched]
+                dup_slug = next((s for s, i in movie_slug_to_id.items() if i == dup_id), None)
+                if dup_slug:
+                    print(f'  >> Dedup: "{title_en}" → existing movie via Arabic title after enrichment')
+                    movie_slug_to_id[slug] = dup_id
+                    existing_slugs.add(slug)
+                    slug = dup_slug
+                    # Backfill TMDB data on existing record if missing
+                    if poster_url or tmdb_id:
+                        try:
+                            upd: dict = {}
+                            if poster_url:
+                                upd['poster_url'] = poster_url
+                            if tmdb_id:
+                                upd['tmdb_id'] = tmdb_id
+                            supabase.table('movies').update(upd).eq('id', dup_id)\
+                                .is_('poster_url', 'null').execute()
+                        except Exception:
+                            pass
+                    continue  # skip insertion — use existing movie for showtimes
+
+            movie_row: dict = {
                 'title_en':     title_en,
                 'title_ar':     raw_st.get('movie_title_ar') or enriched.get('title_ar'),
                 'slug':         slug,
@@ -973,19 +1013,34 @@ async def save_to_supabase(
                 'poster_url':   poster_url,
                 'enriched_at':  datetime.now(timezone.utc).isoformat(),
             }
+            if tmdb_id:
+                movie_row['tmdb_id'] = tmdb_id
             try:
                 res = supabase.table('movies').upsert(movie_row, on_conflict='slug').execute()
-                movie_slug_to_id[slug] = res.data[0]['id']
+                new_id = res.data[0]['id']
+                movie_slug_to_id[slug] = new_id
+                existing_slugs.add(slug)
+                # Update in-memory indexes so later movies in same run can dedup against this
+                if tmdb_id:
+                    movie_tmdb_to_id[tmdb_id] = new_id
+                ar_title = movie_row.get('title_ar', '')
+                if ar_title:
+                    movie_ar_to_id[ar_title.strip().lower()] = new_id
                 new_movies += 1
             except Exception as e:
                 print(f'  ERR Failed to upsert movie "{title_en}": {e}')
         else:
-            # Movie exists — backfill poster if it's missing
+            # ── Existing movie: backfill TMDB data if missing ─────────────────
             movie_id = movie_slug_to_id.get(slug)
-            if movie_id and poster_url:
+            if movie_id and (poster_url or tmdb_id):
                 try:
-                    supabase.table('movies').update({'poster_url': poster_url})\
-                        .eq('id', movie_id).is_('poster_url', 'null').execute()
+                    upd = {}
+                    if poster_url:
+                        upd['poster_url'] = poster_url
+                    if tmdb_id:
+                        upd['tmdb_id'] = tmdb_id
+                    supabase.table('movies').update(upd).eq('id', movie_id)\
+                        .is_('poster_url', 'null').execute()
                 except Exception:
                     pass
 

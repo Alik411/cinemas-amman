@@ -851,6 +851,10 @@ def normalize_title(title: str) -> str:
         if len(inside) < len(before) * 0.8:
             title = inside
 
+    # Strip leading articles so "The Super Mario Galaxy Movie" and
+    # "Super Mario Galaxy Movie" resolve to the same slug / TMDB query.
+    title = re.sub(r'^(?:The|A|An)\s+', '', title, flags=re.IGNORECASE).strip()
+
     return title.strip()
 
 

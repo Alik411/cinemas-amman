@@ -166,16 +166,195 @@ async def fetch_tmdb_poster(title_en: str) -> str | None:
 # Step 1: Scrape HTML from cinema website
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def scrape_taj_cinemas(cinema: dict) -> list[dict] | None:
+    """
+    Scrapes tajcinemas.com directly — no Claude needed, all data is server-rendered.
+    Fetches the homepage for movie IDs, then each movie page for dates + showtimes.
+    Returns a list of showtime dicts ready for save_to_supabase.
+    """
+    import aiohttp
+    from datetime import timedelta
+
+    today = datetime.now(timezone.utc) + timedelta(hours=3)
+    name = cinema['name_en']
+
+    headers = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Step 1: fetch homepage
+            async with session.get(
+                'https://tajcinemas.com/', headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status != 200:
+                    print(f'  ERR HTTP {resp.status} from Taj Cinemas homepage')
+                    return None
+                homepage_html = await resp.text()
+
+            # Detect where the "Taj Class" section starts in the homepage
+            taj_class_pos = homepage_html.lower().find('taj class')
+            if taj_class_pos == -1:
+                taj_class_pos = homepage_html.find('id="hot"')
+
+            # Extract all movie IDs with their position (to detect Taj Class)
+            movie_ids_seen: set[str] = set()
+            movies_info: list[dict] = []
+            for m in re.finditer(r'tajcinemas\.com/movies/(\d+)', homepage_html):
+                mid = m.group(1)
+                if mid in movie_ids_seen:
+                    continue
+                movie_ids_seen.add(mid)
+                is_taj_class = taj_class_pos > 0 and m.start() > taj_class_pos
+                movies_info.append({'id': mid, 'is_taj_class': is_taj_class, 'title': None})
+
+            if not movies_info:
+                print(f'  WARN No movies found on Taj Cinemas homepage')
+                return None
+
+            # Try to extract titles from homepage HTML
+            for info in movies_info:
+                mid = info['id']
+                pattern = rf'tajcinemas\.com/movies/{mid}["\'][^>]*>[\s\S]{{0,400}}?<h[1-6][^>]*>\s*([A-Z][^<]{{2,60}}?)\s*</h[1-6]>'
+                tm = re.search(pattern, homepage_html)
+                if tm:
+                    info['title'] = tm.group(1).strip()
+
+            print(f'  >> Found {len(movies_info)} movie(s) on tajcinemas.com')
+
+            all_showtimes: list[dict] = []
+
+            for info in movies_info:
+                movie_id   = info['id']
+                is_taj     = info['is_taj_class']
+                screen_type = 'Taj Class' if is_taj else '2D'
+
+                await asyncio.sleep(0.3)
+
+                async with session.get(
+                    f'https://tajcinemas.com/movies/{movie_id}',
+                    headers=headers, timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    movie_html = await resp.text()
+
+                # Get title: use homepage extraction, else page <title> tag, else first non-TAJ h3
+                title_en = info.get('title')
+                if not title_en:
+                    t = re.search(r'<title[^>]*>\s*([^<|–\-]+?)[\s|–\-]*Taj', movie_html, re.IGNORECASE)
+                    if t:
+                        title_en = t.group(1).strip()
+                if not title_en:
+                    for h3 in re.findall(r'<h3[^>]*>\s*([^<]+)\s*</h3>', movie_html):
+                        if h3.strip().upper() not in ('TAJ', 'TAJ CLASS', ''):
+                            title_en = h3.strip()
+                            break
+                if not title_en:
+                    continue
+
+                # Convert ALL CAPS to Title Case (e.g. "AWEL LEILA" → "Awel Leila")
+                title_en = title_en.strip().title()
+
+                # Extract date tabs: href="#date-748" → "Sun 17"
+                date_tabs = re.findall(r'href="#date-(\d+)"[^>]*>\s*\w+\s+(\d+)\s*<', movie_html)
+
+                # Build date_id → YYYY-MM-DD (handles month rollover)
+                date_id_to_date: dict[str, str] = {}
+                for date_id, day_str in date_tabs:
+                    day = int(day_str)
+                    try:
+                        candidate = today.replace(day=day)
+                        if candidate.date() < (today - timedelta(days=1)).date():
+                            raise ValueError('past')
+                    except ValueError:
+                        m_ = today.month + 1 if today.month < 12 else 1
+                        y_ = today.year if today.month < 12 else today.year + 1
+                        candidate = today.replace(year=y_, month=m_, day=day)
+                    date_id_to_date[date_id] = candidate.strftime('%Y-%m-%d')
+
+                # Extract showtimes per date section
+                for date_id, show_date in date_id_to_date.items():
+                    sec = re.search(
+                        rf'id="date-{date_id}"(.*?)(?=id="date-\d+"|\Z)',
+                        movie_html, re.DOTALL,
+                    )
+                    if not sec:
+                        continue
+                    for session_id, time_str in re.findall(
+                        rf'/movies/{movie_id}/book/{date_id}/(\d+)["\'][^>]*>\s*(\d{{2}}:\d{{2}})\s*<',
+                        sec.group(1),
+                    ):
+                        all_showtimes.append({
+                            'movie_title_en': title_en,
+                            'movie_title_ar':  None,
+                            'show_date':       show_date,
+                            'show_time':       time_str,
+                            'screen_type':     screen_type,
+                            'language':        'English',
+                            'booking_url':     f'https://tajcinemas.com/movies/{movie_id}/book/{date_id}/{session_id}',
+                        })
+
+            print(f'  >> Extracted {len(all_showtimes)} showtime(s) from tajcinemas.com')
+            return all_showtimes if all_showtimes else None
+
+    except Exception as e:
+        err = str(e).encode('ascii', errors='replace').decode('ascii')
+        print(f'  ERR scrape_taj_cinemas: {err}')
+        import traceback; traceback.print_exc()
+        return None
+
+
+async def scrape_prime_jo(cinema: dict) -> str | None:
+    """
+    Fetches showtimes from prime.jo with a simple HTTP GET —
+    no JavaScript or AJAX needed, all data is server-rendered.
+    """
+    import aiohttp
+    url = cinema['scraper_url']
+    name = cinema['name_en']
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                headers={
+                    'User-Agent': random.choice(USER_AGENTS),
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    print(f'  OK Got {len(html):,} chars from {name}')
+                    return html
+                else:
+                    print(f'  ERR HTTP {resp.status} from {name}')
+                    return None
+    except Exception as e:
+        err = str(e).encode('ascii', errors='replace').decode('ascii')
+        print(f'  ERR Error loading {name}: {err}')
+        return None
+
+
 async def scrape_cinema(cinema: dict) -> str | None:
     """
-    Visits the cinema's scraper_url with Playwright to get the CSRF token,
-    then directly POSTs to elcinema's AJAX endpoint to fetch the showtimes HTML.
-    Returns the combined page HTML + showtime HTML, or None on failure.
+    Dispatches to the correct scraper based on the cinema's scraper_url.
+    - prime.jo → simple HTTP GET (server-rendered HTML)
+    - elcinema.com → Playwright + AJAX POST
     """
     import aiohttp
     from datetime import timedelta
     url = cinema['scraper_url']
     name = cinema['name_en']
+
+    # Prime Cinemas has its own website with server-rendered showtimes
+    if 'prime.jo' in url:
+        return await scrape_prime_jo(cinema)
+
     today = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%Y-%m-%d')
 
     async with async_playwright() as p:
@@ -270,7 +449,9 @@ async def scrape_cinema(cinema: dict) -> str | None:
             if ajax_html and len(ajax_html) > 200:
                 return ajax_html  # This is the pure showtime HTML — send directly to Claude
             else:
-                print(f'  WARN AJAX returned empty/small response — no showtimes today?')
+                preview = (ajax_html or '')[:500].encode('ascii', errors='replace').decode('ascii')
+                print(f'  WARN AJAX returned empty/small response ({len(ajax_html or "")} chars):')
+                print(f'  {preview}')
                 return None
 
         except PlaywrightTimeout:
@@ -307,7 +488,12 @@ Match each showtime to its nearest preceding date section header (e.g. <h4> or <
 If you cannot determine the date for a showtime, use {today}.
 """
     else:
-        date_hint = f'\nAll showtimes in this HTML are for {today}.\n'
+        date_hint = f"""
+The HTML contains showtimes for multiple dates.
+Dates may appear as English headings like "Sunday, 17 May 2026" — convert these to YYYY-MM-DD format.
+Match each showtime to its nearest preceding date heading.
+If you cannot determine the date for a showtime, use {today}.
+"""
 
     prompt = f"""Extract movie showtimes from this HTML snippet for {cinema_name}.
 
@@ -717,28 +903,40 @@ async def run_scraper_for_cinema(cinema: dict) -> None:
     print(f'Cinema: {cinema["name_en"]}')
 
     start = time.time()
+    url = cinema.get('scraper_url', '')
 
     try:
+        # ── Taj Cinemas: custom direct parser, no Claude ──────────────────────
+        if 'tajcinemas.com' in url:
+            showtimes = await scrape_taj_cinemas(cinema)
+            if not showtimes:
+                handle_scrape_failure(cinema, 'No showtimes found on tajcinemas.com', start)
+                return
+            await save_to_supabase(showtimes, cinema, start)
+            return
+
+        # ── All other sources: scrape HTML → Claude → save ────────────────────
         html = await scrape_cinema(cinema)
         if not html:
             handle_scrape_failure(cinema, 'Failed to load page (timeout or bot block)', start)
             return
 
-        # Basic bot-detection check: if the page is tiny it's probably a block page
         if len(html) < 2_000:
-            handle_scrape_failure(cinema, f'Suspiciously small response ({len(html)} bytes) — possible bot block', start)
+            preview = html[:600].encode('ascii', errors='replace').decode('ascii')
+            print(f'  WARN Small response ({len(html)} chars). Content:')
+            print(f'  {preview}')
+            handle_scrape_failure(cinema, f'Suspiciously small response ({len(html)} bytes)', start)
             return
 
-        # Extract elcinema work IDs from the raw HTML (used for deduplication only)
-        # We intentionally do NOT use elcinema poster URLs — they're low-res and unreliable.
-        # Posters come from TMDB instead (see fetch_tmdb_poster).
+        # Extract elcinema work IDs for deduplication (no poster URLs used)
         elcinema_data = extract_elcinema_data(html)
-        poster_map: dict[str, str] = {}  # empty — TMDB-only poster resolution
+        poster_map: dict[str, str] = {}
         if elcinema_data:
             print(f'  >> Found {len(elcinema_data)} elcinema work ID(s) in HTML')
 
         showtimes = await parse_with_claude(html, cinema['name_en'])
         await save_to_supabase(showtimes, cinema, start, poster_map, elcinema_data)
+
     except Exception:
         traceback.print_exc()
 

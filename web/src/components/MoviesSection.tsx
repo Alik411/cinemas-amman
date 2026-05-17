@@ -63,6 +63,7 @@ export default function MoviesSection({ moviesWithShowtimes, cinemas, locale }: 
           <option value="3D">3D</option>
           <option value="IMAX">IMAX</option>
           <option value="4DX">4DX</option>
+          <option value="Taj Class">Taj Class</option>
         </select>
 
         {(cinemaFilter || typeFilter) && (

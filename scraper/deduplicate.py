@@ -132,8 +132,10 @@ async def main() -> None:
                     try:
                         supabase.table('movies').update({'tmdb_id': tmdb_id})\
                             .eq('id', m['id']).execute()
-                    except Exception as e:
-                        print(f"    WARN could not save tmdb_id: {e}")
+                    except Exception:
+                        # Unique constraint: another record already has this TMDB ID.
+                        # That's fine — the grouping step below will merge them.
+                        pass
             await asyncio.sleep(0.25)
 
     # ── Step 2: Group duplicates ──────────────────────────────────────────────

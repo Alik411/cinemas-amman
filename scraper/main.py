@@ -1039,7 +1039,7 @@ async def save_to_supabase(
                     continue  # skip insertion — use existing movie for showtimes
 
             movie_row: dict = {
-                'title_en':     title_en,
+                'title_en':     normalize_title(title_en),  # store the clean form, not raw scraper string
                 'title_ar':     raw_st.get('movie_title_ar') or enriched.get('title_ar'),
                 'slug':         slug,
                 'synopsis_en':  enriched.get('synopsis_en'),

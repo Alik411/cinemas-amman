@@ -8,8 +8,48 @@ import './globals.css'
 const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: 'CineAmman | سينما عمّان',
-  description: 'All Amman cinema showtimes in one place — جميع عروض سينمات عمّان في مكان واحد',
+  metadataBase: new URL('https://www.cineamman.com'),
+  title: {
+    default: 'CineAmman | سينما عمّان — أوقات عروض سينمات عمّان',
+    template: '%s | CineAmman سينما عمّان',
+  },
+  description:
+    'أوقات عروض جميع سينمات عمّان في مكان واحد — Grand Cinemas, Prime Cinemas, Taj Cinemas. ' +
+    'All Amman cinema showtimes: movies, times & booking links.',
+  keywords: [
+    'سينما عمان', 'سينمات عمان', 'افلام عمان', 'عروض سينما عمان',
+    'cinema amman', 'cinemas amman', 'movies amman', 'amman showtimes',
+    'grand cinemas amman', 'prime cinemas jordan', 'taj cinemas amman',
+    'what\'s on amman', 'أفلام اليوم عمان',
+  ],
+  alternates: {
+    canonical: 'https://www.cineamman.com',
+    languages: {
+      'en': 'https://www.cineamman.com',
+      'ar': 'https://www.cineamman.com',
+      'x-default': 'https://www.cineamman.com',
+    },
+  },
+  openGraph: {
+    type: 'website',
+    url: 'https://www.cineamman.com',
+    siteName: 'CineAmman | سينما عمّان',
+    title: 'CineAmman | سينما عمّان — أوقات عروض سينمات عمّان',
+    description:
+      'جميع أوقات عروض سينمات عمّان في مكان واحد — All Amman cinema showtimes in one place.',
+    locale: 'ar_JO',
+    alternateLocale: 'en_US',
+  },
+  twitter: {
+    card: 'summary_large_image',
+    title: 'CineAmman | سينما عمّان',
+    description: 'جميع أوقات عروض سينمات عمّان في مكان واحد',
+  },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: { index: true, follow: true },
+  },
   verification: {
     google: '85qoVplLBCw-OHBeObgGXnRdF63AuoCd3W9yineRmzg',
   },

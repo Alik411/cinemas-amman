@@ -15,13 +15,41 @@ export async function generateMetadata({ params }: { params: Promise<{ slug: str
   const { slug } = await params
   const { createClient } = await import('@/lib/supabase/server')
   const supabase = await createClient()
-  const { data: movie } = await supabase.from('movies').select('title_en, synopsis_en, genre_tags').eq('slug', slug).single()
+  const { data: movie } = await supabase
+    .from('movies')
+    .select('title_en, title_ar, synopsis_en, synopsis_ar, genre_tags, poster_url')
+    .eq('slug', slug)
+    .single()
   if (!movie) return {}
+
+  const titleEn = `${movie.title_en} Showtimes in Amman | CineAmman`
+  const titleAr = movie.title_ar
+    ? `أوقات عرض ${movie.title_ar} في عمّان | سينما عمّان`
+    : titleEn
+  const descEn = movie.synopsis_en
+    ? `${movie.synopsis_en.slice(0, 140)}... Book tickets for ${movie.title_en} at Amman cinemas.`
+    : `Showtimes and tickets for ${movie.title_en} at Grand Cinemas, Prime Cinemas and Taj Cinemas in Amman.`
+  const descAr = movie.synopsis_ar
+    ? `${movie.synopsis_ar.slice(0, 140)}... احجز تذاكر ${movie.title_ar ?? movie.title_en} في سينمات عمّان.`
+    : descEn
+
   return {
-    title: `${movie.title_en} Showtimes in Amman | CineAmman`,
-    description: movie.synopsis_en
-      ? `${movie.synopsis_en.slice(0, 150)}... Book tickets for ${movie.title_en} at Amman cinemas.`
-      : `Find showtimes and book tickets for ${movie.title_en} at cinemas in Amman, Jordan.`,
+    title: titleEn,
+    description: descEn,
+    keywords: [
+      movie.title_en, movie.title_ar ?? '',
+      `${movie.title_en} amman`, `${movie.title_en} showtimes`,
+      `${movie.title_ar ?? ''} عمان`, 'سينما عمان',
+    ].filter(Boolean),
+    alternates: {
+      canonical: `https://www.cineamman.com/movies/${slug}`,
+    },
+    openGraph: {
+      title: titleAr,
+      description: descAr,
+      images: movie.poster_url ? [{ url: movie.poster_url, width: 500, height: 750 }] : [],
+      type: 'video.movie',
+    },
   }
 }
 
@@ -72,8 +100,45 @@ export default async function MoviePage({ params }: { params: Promise<{ slug: st
     return acc
   }, {})
 
+  // JSON-LD: Movie + ScreeningEvent for each showtime
+  const jsonLd = {
+    '@context': 'https://schema.org',
+    '@graph': [
+      {
+        '@type': 'Movie',
+        '@id': `https://www.cineamman.com/movies/${slug}#movie`,
+        name: movie.title_en,
+        alternateName: movie.title_ar ?? undefined,
+        description: movie.synopsis_en ?? undefined,
+        image: movie.poster_url ?? undefined,
+        genre: movie.genre_tags ?? [],
+        duration: movie.duration_mins ? `PT${movie.duration_mins}M` : undefined,
+        contentRating: movie.age_rating ?? undefined,
+      },
+      ...(showtimes ?? []).map(st => ({
+        '@type': 'ScreeningEvent',
+        name: `${title} — ${(st as any).cinemas?.name_en ?? ''}`,
+        startDate: `${st.show_date}T${st.show_time}`,
+        url: st.booking_url ?? `https://www.cineamman.com/movies/${slug}`,
+        location: {
+          '@type': 'MovieTheater',
+          name: (st as any).cinemas?.name_en ?? '',
+          address: { '@type': 'PostalAddress', addressLocality: 'Amman', addressCountry: 'JO' },
+        },
+        workPresented: { '@id': `https://www.cineamman.com/movies/${slug}#movie` },
+        offers: st.booking_url
+          ? { '@type': 'Offer', url: st.booking_url, availability: 'https://schema.org/InStock', priceCurrency: 'JOD' }
+          : undefined,
+      })),
+    ],
+  }
+
   return (
     <div className="min-h-screen bg-zinc-950 text-white">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+      />
       <Header locale={locale} />
       <main className="max-w-6xl mx-auto px-4 py-8">
         <Link href="/" className="inline-flex items-center gap-1.5 text-zinc-400 hover:text-white text-sm mb-6 transition-colors">

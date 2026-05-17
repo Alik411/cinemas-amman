@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import Link from 'next/link'
 import { useTranslations } from 'next-intl'
 import { Film } from 'lucide-react'
 import MovieCard from '@/components/MovieCard'
@@ -16,26 +17,73 @@ interface MoviesSectionProps {
   moviesWithShowtimes: MovieWithShowtimes[]
   cinemas: Cinema[]
   locale: string
+  selectedDate: string
+  availableDates: string[]
+  today: string
 }
 
-export default function MoviesSection({ moviesWithShowtimes, cinemas, locale }: MoviesSectionProps) {
+// Format a YYYY-MM-DD date into a short label for the date strip
+function formatDateTab(dateStr: string, today: string, locale: string): { day: string; num: string } {
+  if (dateStr === today) {
+    return { day: locale === 'ar' ? 'اليوم' : 'Today', num: '' }
+  }
+  const d = new Date(dateStr + 'T12:00:00')
+  const dayName = d.toLocaleDateString(locale === 'ar' ? 'ar-JO' : 'en-GB', { weekday: 'short' })
+  const dayNum  = d.toLocaleDateString(locale === 'ar' ? 'ar-JO' : 'en-GB', { day: 'numeric' })
+  return { day: dayName, num: dayNum }
+}
+
+export default function MoviesSection({
+  moviesWithShowtimes,
+  cinemas,
+  locale,
+  selectedDate,
+  availableDates,
+  today,
+}: MoviesSectionProps) {
   const t = useTranslations('home')
   const [cinemaFilter, setCinemaFilter] = useState('')
-  const [typeFilter, setTypeFilter] = useState('')
+  const [typeFilter,   setTypeFilter]   = useState('')
 
   const filtered = moviesWithShowtimes
     .map(({ movie, showtimes }) => {
       let times = showtimes
       if (cinemaFilter) times = times.filter(s => s.cinema_id === cinemaFilter)
-      if (typeFilter) times = times.filter(s => s.screen_type === typeFilter)
+      if (typeFilter)   times = times.filter(s => s.screen_type === typeFilter)
       return { movie, showtimes: times }
     })
     .filter(({ showtimes }) => showtimes.length > 0)
 
+  const isToday = selectedDate === today
+
   return (
     <>
-      {/* Filters */}
-      <div className="flex flex-wrap gap-3">
+      {/* ── Date strip ──────────────────────────────────────────────────── */}
+      {availableDates.length > 1 && (
+        <div className="flex gap-2 overflow-x-auto pb-1 mb-6 scrollbar-hide -mx-1 px-1">
+          {availableDates.map(date => {
+            const { day, num } = formatDateTab(date, today, locale)
+            const isSelected = date === selectedDate
+            return (
+              <Link
+                key={date}
+                href={date === today ? '/' : `/?date=${date}`}
+                className={`flex-shrink-0 flex flex-col items-center px-4 py-2 rounded-xl text-sm font-medium transition-colors border ${
+                  isSelected
+                    ? 'bg-amber-500 text-black border-amber-500'
+                    : 'bg-zinc-900 text-zinc-300 border-zinc-800 hover:border-amber-500/50 hover:text-white'
+                }`}
+              >
+                <span className="text-xs opacity-80">{day}</span>
+                {num && <span className="font-bold">{num}</span>}
+              </Link>
+            )
+          })}
+        </div>
+      )}
+
+      {/* ── Filters ─────────────────────────────────────────────────────── */}
+      <div className="flex flex-wrap gap-3 mb-6">
         <label className="sr-only" htmlFor="cinema-filter">{t('filterByCinema')}</label>
         <select
           id="cinema-filter"
@@ -71,13 +119,13 @@ export default function MoviesSection({ moviesWithShowtimes, cinemas, locale }: 
             onClick={() => { setCinemaFilter(''); setTypeFilter('') }}
             className="text-xs text-zinc-400 hover:text-white px-3 py-2 rounded-lg border border-zinc-700 hover:border-zinc-500 transition-colors"
           >
-            Clear filters
+            {locale === 'ar' ? 'مسح الفلاتر' : 'Clear filters'}
           </button>
         )}
       </div>
 
-      {/* Now Showing */}
-      <section className="mt-8">
+      {/* ── Now Showing ─────────────────────────────────────────────────── */}
+      <section>
         <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
           <Film size={20} className="text-amber-400" />
           {t('nowShowing')}
@@ -98,7 +146,7 @@ export default function MoviesSection({ moviesWithShowtimes, cinemas, locale }: 
         )}
       </section>
 
-      {/* Full showtime grid */}
+      {/* ── Full showtime grid ───────────────────────────────────────────── */}
       {filtered.length > 0 && (
         <section className="mt-12">
           <h2 className="text-xl font-bold mb-6">{t('todaysShowtimes')}</h2>

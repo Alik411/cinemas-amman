@@ -20,6 +20,7 @@ USER_AGENTS = [
 # Change this to whichever cinema URL you want to debug
 TEST_URL = 'https://elcinema.com/en/theater/3101465/'  # Grand Cinemas Abdali Mall
 
+
 async def main():
     today = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%Y-%m-%d')
     print(f'Fetching AJAX for date: {today}')

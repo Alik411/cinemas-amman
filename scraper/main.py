@@ -696,7 +696,7 @@ async def save_to_supabase(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def handle_scrape_failure(cinema: dict, error_message: str, start_time: float) -> None:
-    """Logs a failure and deactivates the cinema if it keeps failing."""
+    """Logs a failure for this cinema (never deactivates it automatically)."""
     duration_ms = int((time.time() - start_time) * 1000)
     supabase.table('scraper_logs').insert({
         'cinema_id':     cinema['id'],
@@ -704,11 +704,7 @@ def handle_scrape_failure(cinema: dict, error_message: str, start_time: float) -
         'error_message': error_message,
         'duration_ms':   duration_ms,
     }).execute()
-
-    failures = get_consecutive_failures(cinema['id'])
-    if failures >= FAILURE_THRESHOLD:
-        supabase.table('cinemas').update({'active': False}).eq('id', cinema['id']).execute()
-        print(f'  WARN {cinema["name_en"]} deactivated after {failures} consecutive failures')
+    print(f'  WARN {cinema["name_en"]} failed — will retry next run')
 
 
 # ─────────────────────────────────────────────────────────────────────────────

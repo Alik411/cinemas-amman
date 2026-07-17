@@ -1150,6 +1150,148 @@ def handle_scrape_failure(cinema: dict, error_message: str, start_time: float) -
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Post-scrape deduplication (runs after every scraper run)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bare(title: str) -> str:
+    """Aggressively normalize a title to a bare alphanumeric string for fuzzy matching.
+    Decodes HTML entities first so &#039; == ' don't cause mismatches."""
+    import html as _html
+    return re.sub(r'[^a-z0-9]', '', normalize_title(_html.unescape(title)).lower())
+
+
+def dedup_after_scrape() -> None:
+    """
+    Merge duplicate movie records that slipped through the insertion-time dedup.
+    Runs automatically at the end of every scraper run.
+
+    Dedup strategy (three passes):
+      1. TMDB ID     — group movies sharing a non-null tmdb_id
+      2. Arabic title — group remaining movies with identical non-null title_ar
+                        (catches transliteration variants like "Bershamah"/"BERSHAMA"
+                        when they share the same Arabic name)
+      3. Bare English title — group by HTML-decoded, stripped, lowercased title_en
+                        (catches minor spelling/entity differences in the Latin title)
+
+    For each duplicate group: keep the record with the most showtimes (canonical),
+    re-point all other showtimes to it, backfill any missing fields, delete the rest.
+    """
+    import html as _html
+    print('\n-- Post-scrape deduplication --')
+
+    # Load all movies
+    movies_res = supabase.table('movies').select(
+        'id,title_en,title_ar,tmdb_id,poster_url,synopsis_en,synopsis_ar,'
+        'duration_mins,age_rating,genre_tags,trailer_youtube_id'
+    ).execute()
+    movies = movies_res.data or []
+    if not movies:
+        print('  No movies found.')
+        return
+
+    # Decode any stored HTML entities in English titles (e.g. &#039; → ')
+    for m in movies:
+        if m.get('title_en'):
+            m['title_en'] = _html.unescape(m['title_en'])
+
+    # Load showtime counts per movie
+    counts_res = supabase.table('showtimes').select('movie_id').execute()
+    counts: dict[str, int] = {}
+    for row in (counts_res.data or []):
+        mid = row['movie_id']
+        counts[mid] = counts.get(mid, 0) + 1
+
+    merged_total = 0
+    deleted_set: set[str] = set()   # track IDs deleted so later passes skip them
+
+    def merge_group(group: list[dict]) -> None:
+        nonlocal merged_total
+        # Skip any already-deleted records
+        group = [m for m in group if m['id'] not in deleted_set]
+        if len(group) < 2:
+            return
+        # Canonical = most showtimes; tie-break = largest id for determinism
+        canonical = max(group, key=lambda m: (counts.get(m['id'], 0), m['id']))
+        duplicates = [m for m in group if m['id'] != canonical['id']]
+
+        titles = [m['title_en'] for m in group]
+        print(f'  MERGE {titles} → keeping "{canonical["title_en"]}" ({counts.get(canonical["id"], 0)} showtimes)')
+
+        for dup in duplicates:
+            # Re-point showtimes
+            try:
+                supabase.table('showtimes').update({'movie_id': canonical['id']}).eq('movie_id', dup['id']).execute()
+            except Exception as e:
+                print(f'    WARN Could not re-point showtimes from {dup["id"]}: {e}')
+                continue  # Don't delete if we couldn't re-point
+
+            # Backfill missing fields on canonical
+            patch: dict = {}
+            for field in ('title_ar', 'poster_url', 'synopsis_en', 'synopsis_ar',
+                          'duration_mins', 'age_rating', 'genre_tags',
+                          'trailer_youtube_id', 'tmdb_id'):
+                if not canonical.get(field) and dup.get(field):
+                    patch[field] = dup[field]
+                    canonical[field] = dup[field]  # keep in-memory state consistent
+
+            if patch:
+                try:
+                    supabase.table('movies').update(patch).eq('id', canonical['id']).execute()
+                except Exception:
+                    pass  # Non-fatal
+
+            # Delete duplicate
+            try:
+                supabase.table('movies').delete().eq('id', dup['id']).execute()
+                deleted_set.add(dup['id'])
+                merged_total += 1
+            except Exception as e:
+                print(f'    WARN Could not delete duplicate {dup["id"]}: {e}')
+
+        # Update canonical's showtime count in memory
+        counts[canonical['id']] = sum(counts.get(m['id'], 0) for m in group)
+
+    # ── Pass 1: group by TMDB ID ──────────────────────────────────────────────
+    by_tmdb: dict[int, list[dict]] = {}
+    for m in movies:
+        tid = m.get('tmdb_id')
+        if tid:
+            by_tmdb.setdefault(tid, []).append(m)
+
+    for group in by_tmdb.values():
+        merge_group(group)
+
+    # ── Pass 2: group by Arabic title (catches transliteration variants) ───────
+    by_ar: dict[str, list[dict]] = {}
+    for m in movies:
+        if m['id'] in deleted_set:
+            continue
+        ar = (m.get('title_ar') or '').strip()
+        if ar:
+            by_ar.setdefault(ar, []).append(m)
+
+    for group in by_ar.values():
+        merge_group(group)
+
+    # ── Pass 3: group remaining by bare-normalized English title ──────────────
+    by_bare: dict[str, list[dict]] = {}
+    for m in movies:
+        if m['id'] in deleted_set:
+            continue
+        key = _bare(m.get('title_en') or '')
+        if key:
+            by_bare.setdefault(key, []).append(m)
+
+    for group in by_bare.values():
+        merge_group(group)
+
+    if merged_total:
+        print(f'  Dedup complete: {merged_total} duplicate(s) removed.')
+    else:
+        print('  No duplicates found.')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1249,6 +1391,12 @@ async def run_all_scrapers() -> None:
     print(f'\n{"="*50}')
     print('All scrapers finished.')
     print('=' * 50)
+
+    # Auto-dedup: catch any transliteration variants or other duplicates
+    try:
+        dedup_after_scrape()
+    except Exception as e:
+        print(f'WARN dedup_after_scrape failed: {e}')
 
 
 if __name__ == '__main__':
